@@ -1,5 +1,5 @@
-import React, { forwardRef, useEffect, useMemo } from "react";
-import { useLoader } from "@react-three/fiber";
+import React, { forwardRef, useEffect, useMemo, useRef } from "react";
+import { useFrame, useLoader } from "@react-three/fiber";
 import { useAnimations, useFBX } from "@react-three/drei";
 import * as THREE from "three";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
@@ -9,37 +9,47 @@ import characterUrl from "../../assets/models/Characters/X Bot.fbx";
 
 export const CHARACTER_SCALE = 0.01;
 
-// CRA's context loader discovers any Mixamo FBX files added to this folder.
-// Keep X Bot.fbx as the character mesh; all other FBX files are animation clips.
+/* ------------------------------------------------------------------ */
+/* Discover animation files                                           */
+/* ------------------------------------------------------------------ */
+
 const animationContext = require.context(
   "../../assets/models/Characters",
   false,
   /\.fbx$/i,
 );
+
 const animationKeys = animationContext
   .keys()
   .filter((key) => !/x\s*bot\.fbx$/i.test(key));
+
 const animationUrls = animationKeys.map((key) => animationContext(key));
 
 const normalize = (value) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
 
 const ANIMATION_ALIASES = {
   idle: ["idle", "standingidle"],
-  walk: ["walk", "walking"],
-  run: ["run", "running"],
-  jump: ["jump", "jumping"],
-  wave: ["wave", "waving"],
-  dance: ["dance", "hiphopdancing", "breakdance"],
-  salute: ["salute"],
-  celebrate: ["celebrate", "celebration", "victory"],
-  point: ["point", "pointing"],
-  sit: ["sit", "sittingidle", "sitting"],
-  enterCar: ["entercar", "gettingintoacar", "enteringcar", "walk", "walking"],
-  exitCar: ["exitcar", "gettingoutofacar", "exitingcar", "walk", "walking"],
+  walk: ["walking", "walk"],
+  run: ["running", "run"],
+  sprint: ["sprint", "running", "run"],
+  backward: ["walkingbackwards", "walkbackwards", "backwardwalking"],
+  strafeLeft: ["leftstrafe", "strafingleft"],
+  strafeRight: ["rightstrafe", "strafingright", "leftstrafe"],
+  crouchIdle: ["crouchingidle", "crouchidle"],
+  crouchWalk: ["crouchwalk", "crouchingwalk"],
+  jump: ["jumping", "jump"],
+  wave: ["wave", "waving", "idle"],
+  dance: ["macarenadance", "hiphopdancing", "breakdance", "crouchwalk"],
+  salute: ["salute", "jumping"],
+  celebrate: ["celebrate", "celebration", "victory", "jumping"],
+  point: ["point", "pointing", "crouchingidle"],
+  sit: ["sit", "sittingidle", "sitting", "crouchingidle"],
+  drivingSeat: ["driving"],
+  enterCar: ["enteringcar"],
+  exitCar: ["exitingcar"],
 };
 
 const ONE_SHOT = new Set([
-  "jump",
   "wave",
   "dance",
   "salute",
@@ -50,31 +60,68 @@ const ONE_SHOT = new Set([
   "exitCar",
 ]);
 
+const MISSING_CLIP_FALLBACK_MS = 650;
+
+/**
+ * Mixamo FBX animations bake horizontal root motion into the Hips position track,
+ * which makes the character mesh drift away from its collider and snap back.
+ * Lock X and Z on the Hips position track to keep animations in-place.
+ */
+function stripRootMotion(clip) {
+  clip.tracks.forEach((track) => {
+    if (/hips\.position$/i.test(track.name)) {
+      const values = track.values;
+      const baseX = values[0] || 0;
+      const baseZ = values[2] || 0;
+      for (let i = 0; i < values.length; i += 3) {
+        values[i] = baseX;
+        values[i + 2] = baseZ;
+      }
+    }
+  });
+  return clip;
+}
+
 const CharacterModel = forwardRef(function CharacterModel(
-  { animation = "idle", visible = true, onAnimationFinished },
+  {
+    animation = "idle",
+    visible = true,
+    steerValue = 0,
+    onAnimationFinished,
+    onAnimationProgress,
+  },
   forwardedRef,
 ) {
   const sourceCharacter = useFBX(characterUrl);
+
   const character = useMemo(
     () => cloneSkeleton(sourceCharacter),
     [sourceCharacter],
   );
+
+  const bonesRef = useMemo(() => ({}), []);
+  const activeAnimationRef = useRef(null);
+
   const animationModels = useLoader(FBXLoader, animationUrls);
 
   const clips = useMemo(() => {
     const output = [];
+
     animationModels.forEach((fbx, index) => {
-      const key = animationKeys[index];
-      const fileName = key
+      const filePath = animationKeys[index];
+      const fileName = filePath
         .split("/")
         .pop()
         .replace(/\.fbx$/i, "");
-      const clip = fbx.animations?.[0];
-      if (!clip) return;
-      const cloned = clip.clone();
-      cloned.name = normalize(fileName);
-      output.push(cloned);
+
+      const sourceClip = fbx.animations?.[0];
+      if (!sourceClip) return;
+
+      const clip = stripRootMotion(sourceClip.clone());
+      clip.name = normalize(fileName);
+      output.push(clip);
     });
+
     return output;
   }, [animationModels]);
 
@@ -82,57 +129,134 @@ const CharacterModel = forwardRef(function CharacterModel(
 
   useEffect(() => {
     character.traverse((node) => {
+      if (node.isBone) {
+        bonesRef[node.name] = node;
+      }
       if (!node.isMesh) return;
+
       node.castShadow = true;
       node.receiveShadow = true;
       node.frustumCulled = false;
+
+      if (node.material) {
+        const materials = Array.isArray(node.material)
+          ? node.material
+          : [node.material];
+
+        materials.forEach((material) => {
+          if (!material) return;
+          material.side = THREE.FrontSide;
+          material.needsUpdate = true;
+        });
+      }
     });
+  }, [character, bonesRef]);
+
+  useEffect(() => {
+    // Rotate the inner FBX model by +90 deg so local +X is forward (matching CarController),
+    // or keep standard Mixamo +Z and let CharacterController align rotation.
+    character.rotation.set(0, 0, 0);
   }, [character]);
 
   useEffect(() => {
     const aliases = ANIMATION_ALIASES[animation] || [normalize(animation)];
+
     let action = null;
+
     for (const alias of aliases) {
-      action = actions[alias];
-      if (action) break;
+      if (actions[alias]) {
+        action = actions[alias];
+        break;
+      }
     }
 
-    // No matching clip: stop the previous action and leave the rig in its
-    // authored rest pose rather than playing an unrelated animation.
     Object.values(actions).forEach((candidate) => {
-      if (candidate && candidate !== action) candidate.fadeOut(0.18);
+      if (candidate && candidate !== action) {
+        candidate.fadeOut(0.15);
+      }
     });
 
-    if (!action) return undefined;
+    if (!action) {
+      console.error(
+        `[CharacterModel] Animation not found: ${animation}`,
+        Object.keys(actions),
+      );
+
+      if (ONE_SHOT.has(animation)) {
+        const timer = window.setTimeout(() => {
+          onAnimationFinished?.(animation);
+        }, MISSING_CLIP_FALLBACK_MS);
+
+        return () => window.clearTimeout(timer);
+      }
+
+      return undefined;
+    }
 
     const oneShot = ONE_SHOT.has(animation);
+
     action.reset();
     action.enabled = true;
+    action.paused = false;
     action.clampWhenFinished = oneShot;
+    action.timeScale = 1;
+
     action.setLoop(
       oneShot ? THREE.LoopOnce : THREE.LoopRepeat,
       oneShot ? 1 : Infinity,
     );
-    action.fadeIn(0.18).play();
 
-    let finishTimer;
+    console.log("[Character Animation]", {
+      requested: animation,
+      selected: action.getClip().name,
+      duration: action.getClip().duration,
+      oneShot,
+    });
+
+    const handleFinished = (event) => {
+      if (event.action !== action) return;
+      onAnimationFinished?.(animation);
+    };
+
     if (oneShot) {
-      const duration = action.getClip().duration || 1.2;
-      finishTimer = window.setTimeout(
-        () => {
-          onAnimationFinished?.(animation);
-        },
-        Math.max(350, duration * 1000),
-      );
+      mixer.addEventListener("finished", handleFinished);
     }
 
+    activeAnimationRef.current = { animation, action };
+    onAnimationProgress?.(animation, 0);
+    action.fadeIn(0.2).play();
+
     return () => {
-      if (finishTimer) window.clearTimeout(finishTimer);
+      if (activeAnimationRef.current?.action === action) {
+        activeAnimationRef.current = null;
+      }
+      if (oneShot) {
+        mixer.removeEventListener("finished", handleFinished);
+      }
+
+      action.fadeOut(0.15);
     };
-  }, [animation, actions, onAnimationFinished]);
+  }, [animation, actions, mixer, onAnimationFinished, onAnimationProgress]);
+
+  // Publish the live Mixamo clip progress for synchronized vehicle animation.
+  useFrame(() => {
+    const active = activeAnimationRef.current;
+    if (!active) return;
+
+    const duration = active.action.getClip().duration;
+    if (!duration || duration <= 0) return;
+
+    const progress = THREE.MathUtils.clamp(active.action.time / duration, 0, 1);
+
+    onAnimationProgress?.(active.animation, progress);
+  });
+
+  // Apply seated driving posture when inside the car
 
   useEffect(() => {
-    return () => mixer.stopAllAction();
+    return () => {
+      mixer.stopAllAction();
+    };
   }, [mixer]);
 
   return (

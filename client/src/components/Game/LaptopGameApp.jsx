@@ -5,7 +5,7 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { Canvas } from "@react-three/fiber";
+import { Canvas, useFrame } from "@react-three/fiber";
 import { PerspectiveCamera, Loader } from "@react-three/drei";
 import * as THREE from "three";
 import { io } from "socket.io-client";
@@ -21,35 +21,97 @@ import DrivingWorld from "../World/DrivingWorld";
 import FollowCamera from "../World/FollowCamera";
 import BMWM4 from "../Car/BMWM4";
 import CarController from "../Car/CarController";
-import CharacterModel from "../Character/CharacterModel";
+import CharacterModel, { CHARACTER_SCALE } from "../Character/CharacterModel";
 import CharacterController from "../Character/CharacterController";
 import Icons from "../UI/Icons";
 import SteeringWheelGraphic from "../UI/SteeringWheelGraphic";
 import SportSpeedometer from "../UI/SportSpeedometer";
 import { GameSettingsModal, QrConnectModal } from "../UI/GameModals";
 
-const DRIVER_DOOR_OFFSET = new THREE.Vector3(-0.25, 0, 1.42);
-const INTERACTION_DISTANCE = 3.4;
-const MAX_ENTER_SPEED_KMH = 2.5;
-const TRANSITION_FALLBACK_MS = 1600;
+// Car faces +X when yaw = 0, so Left (driver side) is -Z
+const DRIVER_DOOR_OFFSET = new THREE.Vector3(0.05, 0, -1.35);
+const DRIVER_SEAT_OFFSET = new THREE.Vector3(-0.08, 0.18, -0.34);
+const INTERACTION_DISTANCE = 3.6;
+const MAX_ENTER_SPEED_KMH = 5.0;
 
 const EMOTES = [
   { key: "1", id: "wave", label: "Wave" },
-  { key: "2", id: "dance", label: "Dance" },
+  { key: "2", id: "dance", label: "Macarena Dance" },
   { key: "3", id: "salute", label: "Salute" },
   { key: "4", id: "celebrate", label: "Celebrate" },
   { key: "5", id: "point", label: "Point" },
   { key: "6", id: "sit", label: "Sit" },
 ];
 
-function getDriverDoorPosition(car, target = new THREE.Vector3()) {
+const UP_AXIS = new THREE.Vector3(0, 1, 0);
+
+function getCarWorldPoint(car, localOffset, target = new THREE.Vector3()) {
   if (!car) return target.set(0, 0, 0);
-  const yaw = car.rotation.y;
-  target
-    .copy(DRIVER_DOOR_OFFSET)
-    .applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+  target.copy(localOffset).applyAxisAngle(UP_AXIS, car.rotation.y);
   target.add(car.position);
   return target;
+}
+
+/**
+ * Keeps the character model seated inside the car while driving,
+ * and smoothly interpolates the character through the open door during enter/exit.
+ */
+function VehicleOccupantSync({
+  carRef,
+  characterRef,
+  playerMode,
+  doorProgressRef,
+}) {
+  const doorPos = useRef(new THREE.Vector3());
+  const seatPos = useRef(new THREE.Vector3());
+
+  useFrame(() => {
+    const car = carRef.current;
+    const character = characterRef.current;
+    if (!car || !character) return;
+
+    const forwardSeatYaw = car.rotation.y + Math.PI / 2;
+
+    if (playerMode === "driving") {
+      getCarWorldPoint(car, DRIVER_SEAT_OFFSET, seatPos.current);
+      character.position.copy(seatPos.current);
+      character.rotation.set(car.rotation.x, forwardSeatYaw, car.rotation.z);
+      character.scale.setScalar(CHARACTER_SCALE * 0.86);
+      return;
+    }
+
+    if (playerMode === "entering" || playerMode === "exiting") {
+      const progress = THREE.MathUtils.clamp(
+        doorProgressRef?.current?.progress ?? 0,
+        0,
+        1,
+      );
+
+      getCarWorldPoint(car, DRIVER_DOOR_OFFSET, doorPos.current);
+      getCarWorldPoint(car, DRIVER_SEAT_OFFSET, seatPos.current);
+
+      if (playerMode === "entering") {
+        const moveT = THREE.MathUtils.smoothstep(progress, 0.32, 0.96);
+        character.position.lerpVectors(doorPos.current, seatPos.current, moveT);
+        character.rotation.set(0, forwardSeatYaw, 0);
+        character.scale.setScalar(
+          THREE.MathUtils.lerp(CHARACTER_SCALE, CHARACTER_SCALE * 0.86, moveT),
+        );
+      } else {
+        const moveT = THREE.MathUtils.smoothstep(progress, 0.28, 0.84);
+        character.position.lerpVectors(seatPos.current, doorPos.current, moveT);
+        character.rotation.set(0, forwardSeatYaw - moveT * 0.4, 0);
+        character.scale.setScalar(
+          THREE.MathUtils.lerp(CHARACTER_SCALE * 0.86, CHARACTER_SCALE, moveT),
+        );
+      }
+      return;
+    }
+
+    character.scale.setScalar(CHARACTER_SCALE);
+  });
+
+  return null;
 }
 
 export default function LaptopGameApp() {
@@ -60,8 +122,7 @@ export default function LaptopGameApp() {
   const [qrModalOpen, setQrModalOpen] = useState(false);
   const [phoneLinked, setPhoneLinked] = useState(false);
   const [playerMode, setPlayerMode] = useState("driving"); // driving | onFoot | entering | exiting
-  const [charAnimation, setCharAnimation] = useState("idle");
-  const [characterVisible, setCharacterVisible] = useState(false);
+  const [charAnimation, setCharAnimation] = useState("drivingSeat");
   const [nearCar, setNearCar] = useState(false);
   const [interactionMessage, setInteractionMessage] = useState("");
   const [emoteActive, setEmoteActive] = useState(false);
@@ -73,9 +134,13 @@ export default function LaptopGameApp() {
   const characterRef = useRef(null);
   const wheelAssembliesRef = useRef([]);
   const socketRef = useRef(null);
-  const transitionTimerRef = useRef(null);
+  const doorProgressRef = useRef({
+    animation: null,
+    progress: 0,
+  });
   const interactionPointRef = useRef(new THREE.Vector3());
   const cameraYawRef = useRef(0);
+
   const physicsStateRef = useRef({
     vx: 0,
     vy: 0,
@@ -83,13 +148,23 @@ export default function LaptopGameApp() {
     isDrifting: false,
     boost: false,
   });
+
   const remoteInputRef = useRef({
     accelerate: false,
     brake: false,
     handbrake: false,
     boost: false,
     jump: false,
+    crouch: false,
+    sprint: false,
+    autoRun: false,
     steer: 0,
+    moveX: 0,
+    moveY: 0,
+    lookX: 0,
+    lookY: 0,
+    lookDeltaX: 0,
+    lookDeltaY: 0,
     reset: false,
   });
 
@@ -104,7 +179,16 @@ export default function LaptopGameApp() {
       handbrake: false,
       boost: false,
       jump: false,
+      crouch: false,
+      sprint: false,
+      autoRun: false,
       steer: 0,
+      moveX: 0,
+      moveY: 0,
+      lookX: 0,
+      lookY: 0,
+      lookDeltaX: 0,
+      lookDeltaY: 0,
     });
   }, []);
 
@@ -117,14 +201,28 @@ export default function LaptopGameApp() {
 
   const finishTransition = useCallback((expectedMode) => {
     if (expectedMode === "entering") {
-      setCharacterVisible(false);
       setPlayerMode("driving");
+      setCharAnimation("drivingSeat");
+      setInteractionMessage("");
     } else if (expectedMode === "exiting") {
+      if (carRef.current && characterRef.current) {
+        const door = getCarWorldPoint(
+          carRef.current,
+          DRIVER_DOOR_OFFSET,
+          interactionPointRef.current,
+        );
+        characterRef.current.position.copy(door);
+        characterRef.current.rotation.set(
+          0,
+          carRef.current.rotation.y + Math.PI / 2,
+          0,
+        );
+      }
       setPlayerMode("onFoot");
       setCharAnimation("idle");
+      setInteractionMessage("");
     }
     setEmoteActive(false);
-    transitionTimerRef.current = null;
   }, []);
 
   const enterVehicle = useCallback(() => {
@@ -141,23 +239,19 @@ export default function LaptopGameApp() {
     }
 
     clearRemoteInput();
-    const door = getDriverDoorPosition(
+    const door = getCarWorldPoint(
       carRef.current,
+      DRIVER_DOOR_OFFSET,
       interactionPointRef.current,
     );
     characterRef.current.position.copy(door);
     characterRef.current.rotation.y = carRef.current.rotation.y + Math.PI / 2;
+
+    doorProgressRef.current = { animation: "enterCar", progress: 0 };
     setEmoteActive(false);
     setCharAnimation("enterCar");
     setPlayerMode("entering");
-    setInteractionMessage("Entering BMW M4...");
-
-    if (transitionTimerRef.current)
-      window.clearTimeout(transitionTimerRef.current);
-    transitionTimerRef.current = window.setTimeout(
-      () => finishTransition("entering"),
-      TRANSITION_FALLBACK_MS,
-    );
+    setInteractionMessage("Opening door & entering BMW M4...");
   }, [playerMode, nearCar, speedKmh, clearRemoteInput, finishTransition]);
 
   const exitVehicle = useCallback(() => {
@@ -169,23 +263,10 @@ export default function LaptopGameApp() {
     }
 
     clearRemoteInput();
-    const door = getDriverDoorPosition(
-      carRef.current,
-      interactionPointRef.current,
-    );
-    characterRef.current.position.copy(door);
-    characterRef.current.rotation.y = carRef.current.rotation.y + Math.PI / 2;
-    setCharacterVisible(true);
+    doorProgressRef.current = { animation: "exitCar", progress: 0 };
     setCharAnimation("exitCar");
     setPlayerMode("exiting");
-    setInteractionMessage("Exiting BMW M4...");
-
-    if (transitionTimerRef.current)
-      window.clearTimeout(transitionTimerRef.current);
-    transitionTimerRef.current = window.setTimeout(
-      () => finishTransition("exiting"),
-      TRANSITION_FALLBACK_MS,
-    );
+    setInteractionMessage("Opening door & exiting BMW M4...");
   }, [playerMode, speedKmh, clearRemoteInput, finishTransition]);
 
   const toggleVehicle = useCallback(() => {
@@ -207,13 +288,23 @@ export default function LaptopGameApp() {
     [playerMode, emoteActive],
   );
 
+  const handleAnimationProgress = useCallback((animation, progress) => {
+    if (animation !== "enterCar" && animation !== "exitCar") return;
+    doorProgressRef.current = {
+      animation,
+      progress: THREE.MathUtils.clamp(progress, 0, 1),
+    };
+  }, []);
+
   const handleCharacterAnimationFinished = useCallback(
     (finishedAnimation) => {
       if (finishedAnimation === "enterCar") {
+        doorProgressRef.current.progress = 1;
         finishTransition("entering");
         return;
       }
       if (finishedAnimation === "exitCar") {
+        doorProgressRef.current.progress = 1;
         finishTransition("exiting");
         return;
       }
@@ -240,42 +331,62 @@ export default function LaptopGameApp() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [toggleVehicle]);
 
-  // Keep the interaction prompt tied to the actual driver-side door, not the car centre.
+  // Immediately push mode changes to the phone so the Phone HUD switches with zero delay
+  useEffect(() => {
+    socketRef.current?.emit("game:telemetry", {
+      speed: telemetry.speed,
+      gear: telemetry.gear,
+      rpm: telemetry.rpm,
+      drifting: telemetry.drifting,
+      boost: telemetry.boost,
+      playerMode,
+      nearCar,
+    });
+  }, [playerMode, nearCar, telemetry]);
+
+  // Keep the interaction prompt and phone telemetry synced with driver-side door proximity
+  // Keep the interaction prompt and phone telemetry synced every 100ms in ALL modes
   useEffect(() => {
     const interval = window.setInterval(() => {
-      if (playerMode !== "onFoot" || !carRef.current || !characterRef.current) {
+      let canReach = false;
+
+      if (playerMode === "onFoot" && carRef.current && characterRef.current) {
+        const door = getCarWorldPoint(
+          carRef.current,
+          DRIVER_DOOR_OFFSET,
+          interactionPointRef.current,
+        );
+        const distance = characterRef.current.position.distanceTo(door);
+        canReach = distance <= INTERACTION_DISTANCE;
+        setNearCar(canReach);
+        setInteractionMessage(
+          canReach
+            ? speedKmh <= MAX_ENTER_SPEED_KMH
+              ? "Press F or Tap ENTER to get in BMW M4"
+              : "Stop the BMW to enter"
+            : "",
+        );
+      } else {
         setNearCar(false);
         if (playerMode === "driving") {
           setInteractionMessage(
             speedKmh > MAX_ENTER_SPEED_KMH ? "Brake and stop to exit" : "",
           );
         }
-        return;
       }
-      const door = getDriverDoorPosition(
-        carRef.current,
-        interactionPointRef.current,
-      );
-      const distance = characterRef.current.position.distanceTo(door);
-      const canReach = distance <= INTERACTION_DISTANCE;
-      setNearCar(canReach);
-      setInteractionMessage(
-        canReach
-          ? speedKmh <= MAX_ENTER_SPEED_KMH
-            ? "Press F to enter BMW M4"
-            : "Stop the BMW to enter"
-          : "",
-      );
-    }, 120);
-    return () => window.clearInterval(interval);
-  }, [playerMode, speedKmh]);
 
-  useEffect(() => {
-    return () => {
-      if (transitionTimerRef.current)
-        window.clearTimeout(transitionTimerRef.current);
-    };
-  }, []);
+      socketRef.current?.emit("game:telemetry", {
+        speed: telemetry.speed,
+        gear: telemetry.gear,
+        rpm: telemetry.rpm,
+        drifting: telemetry.drifting,
+        boost: telemetry.boost,
+        playerMode,
+        nearCar: canReach,
+      });
+    }, 100);
+    return () => window.clearInterval(interval);
+  }, [playerMode, speedKmh, telemetry]);
 
   useEffect(() => {
     const socket = io(getSocketUrl(), { transports: ["websocket", "polling"] });
@@ -287,11 +398,28 @@ export default function LaptopGameApp() {
       remoteInputRef.current.handbrake = Boolean(data.handbrake);
       remoteInputRef.current.boost = Boolean(data.boost);
       remoteInputRef.current.jump = Boolean(data.jump);
+      remoteInputRef.current.crouch = Boolean(data.crouch);
+      remoteInputRef.current.sprint = Boolean(data.sprint);
+      remoteInputRef.current.autoRun = Boolean(data.autoRun);
       remoteInputRef.current.steer = Number(data.steer) || 0;
+      remoteInputRef.current.moveX = Number(data.moveX) || 0;
+      remoteInputRef.current.moveY = Number(data.moveY) || 0;
+      remoteInputRef.current.lookX = Number(data.lookX) || 0;
+      remoteInputRef.current.lookY = Number(data.lookY) || 0;
+      if (data.lookDeltaX) {
+        remoteInputRef.current.lookDeltaX += Number(data.lookDeltaX) || 0;
+      }
+      if (data.lookDeltaY) {
+        remoteInputRef.current.lookDeltaY += Number(data.lookDeltaY) || 0;
+      }
     });
     socket.on("controller:action", (action) => {
       if (action === "camera") cycleCamera();
       if (action === "reset") remoteInputRef.current.reset = true;
+      if (action === "toggleVehicle") toggleVehicle();
+      if (typeof action === "string" && action.startsWith("emote:")) {
+        playEmote(action.split(":")[1]);
+      }
     });
     socket.on("controller:settings", (settings) => {
       if (settings.steerHudSide) setSteerHudSide(settings.steerHudSide);
@@ -302,11 +430,7 @@ export default function LaptopGameApp() {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [cycleCamera]);
-
-  useEffect(() => {
-    if (playerMode !== "driving") clearRemoteInput();
-  }, [playerMode, clearRemoteInput]);
+  }, [cycleCamera, toggleVehicle, playEmote]);
 
   const handleCollision = useCallback((impactSpeed) => {
     const intensity = Math.max(0, Math.min(1, impactSpeed / 28));
@@ -320,16 +444,21 @@ export default function LaptopGameApp() {
     ]);
   }, []);
 
-  const handleTelemetryChange = useCallback((nextTelemetry) => {
-    setTelemetry(nextTelemetry);
-    socketRef.current?.emit("game:telemetry", {
-      speed: nextTelemetry.speed,
-      gear: nextTelemetry.gear,
-      rpm: nextTelemetry.rpm,
-      drifting: nextTelemetry.drifting,
-      boost: nextTelemetry.boost,
-    });
-  }, []);
+  const handleTelemetryChange = useCallback(
+    (nextTelemetry) => {
+      setTelemetry(nextTelemetry);
+      socketRef.current?.emit("game:telemetry", {
+        speed: nextTelemetry.speed,
+        gear: nextTelemetry.gear,
+        rpm: nextTelemetry.rpm,
+        drifting: nextTelemetry.drifting,
+        boost: nextTelemetry.boost,
+        playerMode,
+        nearCar,
+      });
+    },
+    [playerMode, nearCar],
+  );
 
   const handleWheelsReady = useCallback((rigData) => {
     wheelAssembliesRef.current = rigData;
@@ -376,16 +505,25 @@ export default function LaptopGameApp() {
         <Suspense fallback={null}>
           <BMWM4
             ref={carRef}
+            doorProgressRef={doorProgressRef}
             onWheelsReady={handleWheelsReady}
             onError={handleModelError}
           />
           <CharacterModel
             ref={characterRef}
-            animation={charAnimation}
-            visible={characterVisible}
+            animation={playerMode === "driving" ? "drivingSeat" : charAnimation}
+            visible={true}
+            steerValue={currentSteer}
             onAnimationFinished={handleCharacterAnimationFinished}
+            onAnimationProgress={handleAnimationProgress}
           />
         </Suspense>
+        <VehicleOccupantSync
+          carRef={carRef}
+          characterRef={characterRef}
+          playerMode={playerMode}
+          doorProgressRef={doorProgressRef}
+        />
         <CarController
           carRef={carRef}
           wheelAssembliesRef={wheelAssembliesRef}
@@ -398,19 +536,23 @@ export default function LaptopGameApp() {
         />
         <CharacterController
           characterRef={characterRef}
+          carRef={carRef}
           collidersRef={collidersRef}
           enabled={playerMode === "onFoot"}
           emoteActive={emoteActive}
           cameraYawRef={cameraYawRef}
+          remoteInputRef={remoteInputRef}
           onAnimationChange={setCharAnimation}
           onEmote={(key) => {
             const emote = EMOTES.find((item) => item.key === key);
             if (emote) playEmote(emote.id);
           }}
         />
+
         <FollowCamera
           targetRef={isCharacterMode ? characterRef : carRef}
           physicsStateRef={physicsStateRef}
+          remoteInputRef={remoteInputRef}
           cameraMode={cameraMode}
           isCharacterMode={isCharacterMode}
           orbitYawRef={cameraYawRef}
@@ -431,26 +573,30 @@ export default function LaptopGameApp() {
           {playerMode === "onFoot" ? (
             <button
               type="button"
-              className="mc-icon-btn"
+              className="mc-icon-btn mc-action-pill"
               onClick={enterVehicle}
               disabled={!nearCar || speedKmh > MAX_ENTER_SPEED_KMH}
-              title="Enter BMW M4"
+              title="Enter BMW M4 (F)"
             >
-              ENTER
+              ENTER CAR
             </button>
           ) : playerMode === "driving" ? (
             <button
               type="button"
-              className="mc-icon-btn"
+              className="mc-icon-btn mc-action-pill"
               onClick={exitVehicle}
               disabled={speedKmh > MAX_ENTER_SPEED_KMH}
-              title="Exit BMW M4"
+              title="Exit BMW M4 (F)"
             >
-              EXIT
+              EXIT CAR
             </button>
           ) : (
-            <button type="button" className="mc-icon-btn" disabled>
-              {playerMode === "entering" ? "ENTERING" : "EXITING"}
+            <button
+              type="button"
+              className="mc-icon-btn mc-action-pill"
+              disabled
+            >
+              {playerMode === "entering" ? "ENTERING..." : "EXITING..."}
             </button>
           )}
           <button
@@ -541,13 +687,21 @@ export default function LaptopGameApp() {
             ))}
           </div>
           <div className="character-control-hint">
-            WASD MOVE · SHIFT SPRINT · SPACE JUMP · 1–6 EMOTES · F ENTER
+            WASD / PHONE JOYSTICK MOVE · SWIPE PHONE / DRAG MOUSE TO TURN ·
+            SHIFT SPRINT · SPACE JUMP · F ENTER CAR
           </div>
         </section>
       )}
 
       {(interactionMessage || isTransitioning) && (
-        <div className="vehicle-interaction-prompt">
+        <div
+          className="vehicle-interaction-prompt"
+          style={{
+            pointerEvents: nearCar ? "auto" : "none",
+            cursor: nearCar ? "pointer" : "default",
+          }}
+          onClick={nearCar ? toggleVehicle : undefined}
+        >
           {interactionMessage || "Please wait..."}
         </div>
       )}

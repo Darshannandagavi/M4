@@ -1,6 +1,6 @@
-import React, { forwardRef, useEffect, useMemo } from "react";
+import React, { forwardRef, useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
-import { useThree } from "@react-three/fiber";
+import { useFrame, useThree } from "@react-three/fiber";
 import { useGLTF } from "@react-three/drei";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 
@@ -8,20 +8,10 @@ import modelUrl from "../../assets/models/2021_bmw_m4_competition.glb";
 
 export const BMW_M4_SCALE = 0.73;
 
-// Reflection strength on the car paint/glass.
-// Raise it if the car is still too dark, lower it if it looks washed out.
 const CAR_ENV_INTENSITY = 1.2;
-
-// The GLB's front is +Z. Rotating +90° on Y makes the car face +X,
-// which is what CarController and FollowCamera expect.
 const MODEL_YAW = Math.PI / 2;
-
-// The front wheels are authored with a ~20° showroom steering turn.
-// It is removed once so steering = 0 means "straight ahead".
-// If the front wheels look turned at rest, flip the sign or set this to 0.
 const PRE_POSED_STEER = -0.34906585;
 
-// Names below are taken from the uploaded GLB's actual node hierarchy.
 const WHEEL_DEFINITIONS = [
   {
     id: "front-right",
@@ -57,7 +47,10 @@ const WHEEL_DEFINITIONS = [
   },
 ];
 
-// GLTFLoader renames nodes: spaces become "_" ("brake disc" -> "brake_disc").
+const DOOR_NAME_REGEX =
+  /door.*(l|left|fl|front_l|driver)|^(door_l|door_lf|lf_door|driver_door)/i;
+const GLASS_NAME_REGEX = /glass|window|windshield|windscreen|win_/i;
+
 function getNode(root, name) {
   const loadedName = THREE.PropertyBinding.sanitizeNodeName(name);
   let object = root.getObjectByName(loadedName) || root.getObjectByName(name);
@@ -73,8 +66,6 @@ function getNode(root, name) {
 }
 
 function buildWheelAssemblies(model) {
-  // Refresh every ancestor (incl. the scaled <group>) and descendant first,
-  // so all measurements below use the same up-to-date matrices.
   model.updateWorldMatrix(true, true);
 
   const assemblies = [];
@@ -87,8 +78,6 @@ function buildWheelAssemblies(model) {
     const disc = getNode(model, definition.discName);
     const caliper = getNode(model, definition.caliperName);
 
-    // Only tyres + rim are required. A missing disc or caliper must never
-    // disable steering and rolling for the whole wheel.
     if (!tyres.length || !rim) {
       console.warn(`[BMW M4] Incomplete wheel assembly: ${definition.id}`);
       continue;
@@ -97,14 +86,11 @@ function buildWheelAssemblies(model) {
     const rollingParts = [...tyres, rim];
     if (disc) rollingParts.push(disc);
 
-    // Wheel centre (model space) and radius (world units).
     const box = new THREE.Box3();
     [...tyres, rim].forEach((part) => box.expandByObject(part));
     const centerLocal = model.worldToLocal(box.getCenter(new THREE.Vector3()));
     const radius = (box.max.y - box.min.y) / 2;
 
-    // Pivots sit directly under `model`: steering = rotation.y,
-    // rolling = rotation.x (the axle runs along model X).
     const steeringPivot = new THREE.Group();
     steeringPivot.name = `GAME_STEER_${definition.id}`;
     steeringPivot.position.copy(centerLocal);
@@ -114,8 +100,6 @@ function buildWheelAssemblies(model) {
     rollingPivot.name = `GAME_ROLL_${definition.id}`;
     steeringPivot.add(rollingPivot);
 
-    // Pose the pivot like the authored wheel, attach (keeps world transform),
-    // then reset to straight.
     steeringPivot.rotation.y = definition.front ? PRE_POSED_STEER : 0;
     steeringPivot.updateMatrixWorld(true);
 
@@ -134,23 +118,56 @@ function buildWheelAssemblies(model) {
     });
   }
 
-  console.info(
-    `[BMW M4] Built ${assemblies.length}/${WHEEL_DEFINITIONS.length} wheel pivots.`,
-  );
-
   return assemblies;
 }
 
-// React StrictMode runs effects twice in dev. Build the rig only once per
-// model, otherwise the front wheels would be un-turned twice.
+function buildDriverDoorRig(model) {
+  model.updateWorldMatrix(true, true);
+  const doorParts = [];
+
+  model.traverse((child) => {
+    if (!child.isMesh) return;
+    const combinedName = `${child.name} ${child.parent?.name || ""}`;
+    if (DOOR_NAME_REGEX.test(combinedName)) {
+      doorParts.push(child);
+    }
+  });
+
+  if (!doorParts.length) return null;
+
+  const box = new THREE.Box3();
+  doorParts.forEach((part) => box.expandByObject(part));
+
+  // Hinge at front-outer edge of the left door
+  const hingeWorld = new THREE.Vector3(
+    box.max.x,
+    (box.min.y + box.max.y) * 0.5,
+    box.max.z,
+  );
+  const hingeLocal = model.worldToLocal(hingeWorld);
+
+  const doorPivot = new THREE.Group();
+  doorPivot.name = "GAME_DRIVER_DOOR_PIVOT";
+  doorPivot.position.copy(hingeLocal);
+  model.add(doorPivot);
+  doorPivot.updateMatrixWorld(true);
+
+  doorParts.forEach((part) => doorPivot.attach(part));
+  return doorPivot;
+}
+
 const wheelRigCache = new WeakMap();
+const doorRigCache = new WeakMap();
 
 const BMWM4 = forwardRef(function BMWM4(
-  { onWheelsReady, onError },
+  { onWheelsReady, onError, doorProgressRef },
   forwardedRef,
 ) {
   const { scene } = useGLTF(modelUrl);
   const gl = useThree((state) => state.gl);
+  const doorPivotRef = useRef(null);
+  const animatedDoorRef = useRef(null);
+  const doorAngleRef = useRef(0);
 
   const model = useMemo(() => {
     const clone = scene.clone(true);
@@ -158,9 +175,6 @@ const BMWM4 = forwardRef(function BMWM4(
     return clone;
   }, [scene]);
 
-  // Metallic paint only shows reflections. Without an environment map it
-  // renders as a flat black silhouette. RoomEnvironment is generated locally
-  // (no network download).
   const envMap = useMemo(() => {
     const pmrem = new THREE.PMREMGenerator(gl);
     const texture = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
@@ -183,10 +197,18 @@ const BMWM4 = forwardRef(function BMWM4(
           : [object.material];
 
         materials.filter(Boolean).forEach((material) => {
-          // Car-only reflections, so the map keeps its current look.
           if (material.isMeshStandardMaterial) {
             material.envMap = envMap;
             material.envMapIntensity = CAR_ENV_INTENSITY;
+            material.needsUpdate = true;
+          }
+
+          // Make windows/windshield semi-transparent so the seated driver is visible inside
+          const matName = `${material.name || ""} ${object.name || ""}`;
+          if (GLASS_NAME_REGEX.test(matName) || material.opacity < 0.95) {
+            material.transparent = true;
+            material.opacity = Math.min(material.opacity || 0.42, 0.42);
+            material.depthWrite = false;
             material.needsUpdate = true;
           }
 
@@ -208,16 +230,16 @@ const BMWM4 = forwardRef(function BMWM4(
         wheelRigCache.set(model, assemblies);
       }
 
-      console.table(
-        assemblies.map((wheel) => ({
-          id: wheel.id,
-          front: wheel.isFront,
-          radius: wheel.radius,
-        })),
-      );
+      let doorPivot = doorRigCache.get(model);
+      if (doorPivot === undefined) {
+        doorPivot = buildDriverDoorRig(model);
+        doorRigCache.set(model, doorPivot);
+      }
+      doorPivotRef.current = doorPivot;
+
       if (mounted) onWheelsReady?.(assemblies);
     } catch (error) {
-      console.error("[BMW M4] Wheel setup failed:", error);
+      console.error("[BMW M4] Setup failed:", error);
       if (mounted) onError?.(error);
     }
 
@@ -227,9 +249,59 @@ const BMWM4 = forwardRef(function BMWM4(
     };
   }, [model, envMap, onError, onWheelsReady]);
 
+  useFrame((_, rawDelta) => {
+    const dt = Math.min(rawDelta, 0.05);
+    const timeline = doorProgressRef?.current;
+    let targetAngle = 0;
+
+    if (timeline?.animation === "enterCar") {
+      const p = timeline.progress;
+      const opening = THREE.MathUtils.smoothstep(p, 0.18, 0.38);
+      const closing = 1 - THREE.MathUtils.smoothstep(p, 0.72, 0.85);
+      targetAngle = 1.08 * opening * closing;
+    } else if (timeline?.animation === "exitCar") {
+      const p = timeline.progress;
+      const opening = THREE.MathUtils.smoothstep(p, 0.1, 0.3);
+      const closing = 1 - THREE.MathUtils.smoothstep(p, 0.76, 0.95);
+      targetAngle = 1.08 * opening * closing;
+    }
+
+    doorAngleRef.current = THREE.MathUtils.damp(
+      doorAngleRef.current,
+      targetAngle,
+      18,
+      dt,
+    );
+
+    if (doorPivotRef.current) {
+      doorPivotRef.current.rotation.y = -doorAngleRef.current;
+    }
+    if (animatedDoorRef.current) {
+      animatedDoorRef.current.rotation.y = doorAngleRef.current;
+      animatedDoorRef.current.visible = doorAngleRef.current > 0.03;
+    }
+  });
+
   return (
     <group ref={forwardedRef} scale={BMW_M4_SCALE}>
       <primitive object={model} />
+      {/* Fallback visual driver door swing panel when GLB body is a single merged mesh */}
+      {!doorPivotRef.current && (
+        <group
+          ref={animatedDoorRef}
+          position={[0.55, 0.72, -0.92]}
+          visible={false}
+        >
+          <mesh position={[-0.58, 0, -0.02]} castShadow>
+            <boxGeometry args={[1.15, 0.62, 0.05]} />
+            <meshStandardMaterial
+              color="#1c2430"
+              metalness={0.85}
+              roughness={0.2}
+            />
+          </mesh>
+        </group>
+      )}
     </group>
   );
 });

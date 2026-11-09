@@ -16,8 +16,8 @@ You are helping with an existing software project.
 ## Project Structure
 
 ```text
+├── .gitignore
 ├── client
-│   ├── .gitignore
 │   ├── README.md
 │   ├── package.json
 │   ├── public
@@ -65,33 +65,53 @@ You are helping with an existing software project.
 ```
 
 ===============================================================================
-FILE: client/.gitignore
+FILE: .gitignore
 ===============================================================================
 
 ```text
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+dependencies
 
-# dependencies
-/node_modules
+/client/node_modules
+/server/node_modules
 /.pnp
 .pnp.js
 
-# testing
-/coverage
+testing
 
-# production
-/build
+/client/coverage
+/server/coverage
 
-# misc
-.DS_Store
+production builds
+
+/client/build
+/client/dist
+/server/build
+
+environment variables & local config
+
+.env
 .env.local
 .env.development.local
 .env.test.local
 .env.production.local
+client/.env*
+server/.env*
+
+logs
 
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
+logs
+*.log
+
+editor & operating system files
+
+.DS_Store
+.vscode/
+.idea/
+Thumbs.dbclient/src/assets/models/openworldmap.glb
 ```
 
 ===============================================================================
@@ -410,9 +430,9 @@ FILE: client/src/components/Car/BMWM4.js
 ===============================================================================
 
 ```js
-import React, { forwardRef, useEffect, useMemo } from "react";
+import React, { forwardRef, useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
-import { useThree } from "@react-three/fiber";
+import { useFrame, useThree } from "@react-three/fiber";
 import { useGLTF } from "@react-three/drei";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 
@@ -420,20 +440,10 @@ import modelUrl from "../../assets/models/2021_bmw_m4_competition.glb";
 
 export const BMW_M4_SCALE = 0.73;
 
-// Reflection strength on the car paint/glass.
-// Raise it if the car is still too dark, lower it if it looks washed out.
 const CAR_ENV_INTENSITY = 1.2;
-
-// The GLB's front is +Z. Rotating +90° on Y makes the car face +X,
-// which is what CarController and FollowCamera expect.
 const MODEL_YAW = Math.PI / 2;
-
-// The front wheels are authored with a ~20° showroom steering turn.
-// It is removed once so steering = 0 means "straight ahead".
-// If the front wheels look turned at rest, flip the sign or set this to 0.
 const PRE_POSED_STEER = -0.34906585;
 
-// Names below are taken from the uploaded GLB's actual node hierarchy.
 const WHEEL_DEFINITIONS = [
   {
     id: "front-right",
@@ -469,7 +479,10 @@ const WHEEL_DEFINITIONS = [
   },
 ];
 
-// GLTFLoader renames nodes: spaces become "_" ("brake disc" -> "brake_disc").
+const DOOR_NAME_REGEX =
+  /door.*(l|left|fl|front_l|driver)|^(door_l|door_lf|lf_door|driver_door)/i;
+const GLASS_NAME_REGEX = /glass|window|windshield|windscreen|win_/i;
+
 function getNode(root, name) {
   const loadedName = THREE.PropertyBinding.sanitizeNodeName(name);
   let object = root.getObjectByName(loadedName) || root.getObjectByName(name);
@@ -485,8 +498,6 @@ function getNode(root, name) {
 }
 
 function buildWheelAssemblies(model) {
-  // Refresh every ancestor (incl. the scaled <group>) and descendant first,
-  // so all measurements below use the same up-to-date matrices.
   model.updateWorldMatrix(true, true);
 
   const assemblies = [];
@@ -499,8 +510,6 @@ function buildWheelAssemblies(model) {
     const disc = getNode(model, definition.discName);
     const caliper = getNode(model, definition.caliperName);
 
-    // Only tyres + rim are required. A missing disc or caliper must never
-    // disable steering and rolling for the whole wheel.
     if (!tyres.length || !rim) {
       console.warn(`[BMW M4] Incomplete wheel assembly: ${definition.id}`);
       continue;
@@ -509,14 +518,11 @@ function buildWheelAssemblies(model) {
     const rollingParts = [...tyres, rim];
     if (disc) rollingParts.push(disc);
 
-    // Wheel centre (model space) and radius (world units).
     const box = new THREE.Box3();
     [...tyres, rim].forEach((part) => box.expandByObject(part));
     const centerLocal = model.worldToLocal(box.getCenter(new THREE.Vector3()));
     const radius = (box.max.y - box.min.y) / 2;
 
-    // Pivots sit directly under `model`: steering = rotation.y,
-    // rolling = rotation.x (the axle runs along model X).
     const steeringPivot = new THREE.Group();
     steeringPivot.name = `GAME_STEER_${definition.id}`;
     steeringPivot.position.copy(centerLocal);
@@ -526,8 +532,6 @@ function buildWheelAssemblies(model) {
     rollingPivot.name = `GAME_ROLL_${definition.id}`;
     steeringPivot.add(rollingPivot);
 
-    // Pose the pivot like the authored wheel, attach (keeps world transform),
-    // then reset to straight.
     steeringPivot.rotation.y = definition.front ? PRE_POSED_STEER : 0;
     steeringPivot.updateMatrixWorld(true);
 
@@ -546,23 +550,56 @@ function buildWheelAssemblies(model) {
     });
   }
 
-  console.info(
-    `[BMW M4] Built ${assemblies.length}/${WHEEL_DEFINITIONS.length} wheel pivots.`,
-  );
-
   return assemblies;
 }
 
-// React StrictMode runs effects twice in dev. Build the rig only once per
-// model, otherwise the front wheels would be un-turned twice.
+function buildDriverDoorRig(model) {
+  model.updateWorldMatrix(true, true);
+  const doorParts = [];
+
+  model.traverse((child) => {
+    if (!child.isMesh) return;
+    const combinedName = `${child.name} ${child.parent?.name || ""}`;
+    if (DOOR_NAME_REGEX.test(combinedName)) {
+      doorParts.push(child);
+    }
+  });
+
+  if (!doorParts.length) return null;
+
+  const box = new THREE.Box3();
+  doorParts.forEach((part) => box.expandByObject(part));
+
+  // Hinge at front-outer edge of the left door
+  const hingeWorld = new THREE.Vector3(
+    box.max.x,
+    (box.min.y + box.max.y) * 0.5,
+    box.max.z,
+  );
+  const hingeLocal = model.worldToLocal(hingeWorld);
+
+  const doorPivot = new THREE.Group();
+  doorPivot.name = "GAME_DRIVER_DOOR_PIVOT";
+  doorPivot.position.copy(hingeLocal);
+  model.add(doorPivot);
+  doorPivot.updateMatrixWorld(true);
+
+  doorParts.forEach((part) => doorPivot.attach(part));
+  return doorPivot;
+}
+
 const wheelRigCache = new WeakMap();
+const doorRigCache = new WeakMap();
 
 const BMWM4 = forwardRef(function BMWM4(
-  { onWheelsReady, onError },
+  { onWheelsReady, onError, doorProgressRef },
   forwardedRef,
 ) {
   const { scene } = useGLTF(modelUrl);
   const gl = useThree((state) => state.gl);
+  const doorPivotRef = useRef(null);
+  const animatedDoorRef = useRef(null);
+  const doorAngleRef = useRef(0);
 
   const model = useMemo(() => {
     const clone = scene.clone(true);
@@ -570,9 +607,6 @@ const BMWM4 = forwardRef(function BMWM4(
     return clone;
   }, [scene]);
 
-  // Metallic paint only shows reflections. Without an environment map it
-  // renders as a flat black silhouette. RoomEnvironment is generated locally
-  // (no network download).
   const envMap = useMemo(() => {
     const pmrem = new THREE.PMREMGenerator(gl);
     const texture = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
@@ -595,10 +629,18 @@ const BMWM4 = forwardRef(function BMWM4(
           : [object.material];
 
         materials.filter(Boolean).forEach((material) => {
-          // Car-only reflections, so the map keeps its current look.
           if (material.isMeshStandardMaterial) {
             material.envMap = envMap;
             material.envMapIntensity = CAR_ENV_INTENSITY;
+            material.needsUpdate = true;
+          }
+
+          // Make windows/windshield semi-transparent so the seated driver is visible inside
+          const matName = `${material.name || ""} ${object.name || ""}`;
+          if (GLASS_NAME_REGEX.test(matName) || material.opacity < 0.95) {
+            material.transparent = true;
+            material.opacity = Math.min(material.opacity || 0.42, 0.42);
+            material.depthWrite = false;
             material.needsUpdate = true;
           }
 
@@ -620,16 +662,16 @@ const BMWM4 = forwardRef(function BMWM4(
         wheelRigCache.set(model, assemblies);
       }
 
-      console.table(
-        assemblies.map((wheel) => ({
-          id: wheel.id,
-          front: wheel.isFront,
-          radius: wheel.radius,
-        })),
-      );
+      let doorPivot = doorRigCache.get(model);
+      if (doorPivot === undefined) {
+        doorPivot = buildDriverDoorRig(model);
+        doorRigCache.set(model, doorPivot);
+      }
+      doorPivotRef.current = doorPivot;
+
       if (mounted) onWheelsReady?.(assemblies);
     } catch (error) {
-      console.error("[BMW M4] Wheel setup failed:", error);
+      console.error("[BMW M4] Setup failed:", error);
       if (mounted) onError?.(error);
     }
 
@@ -639,9 +681,59 @@ const BMWM4 = forwardRef(function BMWM4(
     };
   }, [model, envMap, onError, onWheelsReady]);
 
+  useFrame((_, rawDelta) => {
+    const dt = Math.min(rawDelta, 0.05);
+    const timeline = doorProgressRef?.current;
+    let targetAngle = 0;
+
+    if (timeline?.animation === "enterCar") {
+      const p = timeline.progress;
+      const opening = THREE.MathUtils.smoothstep(p, 0.18, 0.38);
+      const closing = 1 - THREE.MathUtils.smoothstep(p, 0.72, 0.85);
+      targetAngle = 1.08 * opening * closing;
+    } else if (timeline?.animation === "exitCar") {
+      const p = timeline.progress;
+      const opening = THREE.MathUtils.smoothstep(p, 0.1, 0.3);
+      const closing = 1 - THREE.MathUtils.smoothstep(p, 0.76, 0.95);
+      targetAngle = 1.08 * opening * closing;
+    }
+
+    doorAngleRef.current = THREE.MathUtils.damp(
+      doorAngleRef.current,
+      targetAngle,
+      18,
+      dt,
+    );
+
+    if (doorPivotRef.current) {
+      doorPivotRef.current.rotation.y = -doorAngleRef.current;
+    }
+    if (animatedDoorRef.current) {
+      animatedDoorRef.current.rotation.y = doorAngleRef.current;
+      animatedDoorRef.current.visible = doorAngleRef.current > 0.03;
+    }
+  });
+
   return (
     <group ref={forwardedRef} scale={BMW_M4_SCALE}>
       <primitive object={model} />
+      {/* Fallback visual driver door swing panel when GLB body is a single merged mesh */}
+      {!doorPivotRef.current && (
+        <group
+          ref={animatedDoorRef}
+          position={[0.55, 0.72, -0.92]}
+          visible={false}
+        >
+          <mesh position={[-0.58, 0, -0.02]} castShadow>
+            <boxGeometry args={[1.15, 0.62, 0.05]} />
+            <meshStandardMaterial
+              color="#1c2430"
+              metalness={0.85}
+              roughness={0.2}
+            />
+          </mesh>
+        </group>
+      )}
     </group>
   );
 });
@@ -1438,11 +1530,40 @@ import { useEffect, useRef } from "react";
 import { useFrame } from "@react-three/fiber";
 import * as THREE from "three";
 
+/* ------------------------------------------------------------------ */
+/* Movement tuning                                                    */
+/* ------------------------------------------------------------------ */
+
 const WALK_SPEED = 3.2;
-const RUN_SPEED = 6.5;
+const RUN_SPEED = 5.4;
+const SPRINT_SPEED = 7.8;
+const CROUCH_SPEED = 1.85;
+
+const GROUND_ACCEL = 42;
+const GROUND_DECEL = 52;
+const AIR_ACCEL = 14;
+const TURN_RATE = 14;
+
 const GRAVITY = 22;
-const JUMP_FORCE = 8.2;
+const JUMP_FORCE = 8.4;
+
+const COYOTE_TIME = 0.12;
+const JUMP_BUFFER = 0.14;
+
+const CHARACTER_RADIUS = 0.34;
+const CHARACTER_HEIGHT = 1.8;
+
+const STEP_HEIGHT = 0.42;
+const MAX_GROUND_DROP = 6.0;
+
 const DEFAULT_GROUND_Y = 0;
+
+const COLLIDER_REFRESH_DISTANCE = 5;
+const COLLIDER_SEARCH_RADIUS = 22;
+
+const CAR_COLLISION_HALF_LEN = 1.72;
+const CAR_COLLISION_HALF_WID = 0.78;
+
 const CONTROL_KEYS = new Set([
   "w",
   "a",
@@ -1454,61 +1575,334 @@ const CONTROL_KEYS = new Set([
   "arrowright",
   "space",
   "shift",
+  "alt",
+  "c",
+  "control",
 ]);
+
+/* ------------------------------------------------------------------ */
+/* Shared Three.js objects                                            */
+/* ------------------------------------------------------------------ */
 
 const DOWN = new THREE.Vector3(0, -1, 0);
 
+const _origin = new THREE.Vector3();
+const _direction = new THREE.Vector3();
+const _normal = new THREE.Vector3();
+const _movement = new THREE.Vector3();
+const _remaining = new THREE.Vector3();
+const _travel = new THREE.Vector3();
+const _horizontalVelocity = new THREE.Vector3();
+
+const _cameraForward = new THREE.Vector3();
+const _cameraRight = new THREE.Vector3();
+const _wishDirection = new THREE.Vector3();
+
+const _groundRaycaster = new THREE.Raycaster();
+const _wallRaycaster = new THREE.Raycaster();
+
+/* ------------------------------------------------------------------ */
+/* Helpers                                                            */
+/* ------------------------------------------------------------------ */
+
+function normalizeKey(key) {
+  if (key === " ") return "space";
+  const normalized = key.toLowerCase();
+  if (normalized === "controlleft" || normalized === "controlright") {
+    return "control";
+  }
+  if (normalized === "shiftleft" || normalized === "shiftright") {
+    return "shift";
+  }
+  if (normalized === "altleft" || normalized === "altright") {
+    return "alt";
+  }
+  return normalized;
+}
+
+function isGroundFace(hit) {
+  if (!hit.face) return false;
+  _normal.copy(hit.face.normal).transformDirection(hit.object.matrixWorld);
+  return Math.abs(_normal.y) > 0.5;
+}
+
+function getNearbyMeshes(cache, colliderEntries, position) {
+  if (!colliderEntries?.ready || !colliderEntries.length) {
+    cache.meshes = [];
+    return cache.meshes;
+  }
+
+  const moved = Math.hypot(
+    position.x - cache.position.x,
+    position.y - cache.position.y,
+    position.z - cache.position.z,
+  );
+
+  const shouldRefresh =
+    cache.source !== colliderEntries ||
+    moved > COLLIDER_REFRESH_DISTANCE ||
+    cache.meshes.length === 0;
+
+  if (!shouldRefresh) {
+    return cache.meshes;
+  }
+
+  cache.source = colliderEntries;
+  cache.position.copy(position);
+
+  cache.meshes = colliderEntries
+    .filter(({ box }) => {
+      return box && box.distanceToPoint(position) < COLLIDER_SEARCH_RADIUS;
+    })
+    .map(({ mesh }) => mesh)
+    .filter(Boolean);
+
+  return cache.meshes;
+}
+
+function findGround(character, meshes) {
+  _origin.set(
+    character.position.x,
+    character.position.y + 2.5,
+    character.position.z,
+  );
+
+  _groundRaycaster.set(_origin, DOWN);
+  _groundRaycaster.near = 0;
+  _groundRaycaster.far = 2.5 + MAX_GROUND_DROP;
+
+  const hits = _groundRaycaster.intersectObjects(meshes, false);
+  let bestGroundY = null;
+
+  for (const hit of hits) {
+    if (!isGroundFace(hit)) continue;
+    const groundY = hit.point.y;
+
+    if (groundY > character.position.y + STEP_HEIGHT) continue;
+    if (groundY < character.position.y - MAX_GROUND_DROP) continue;
+
+    if (bestGroundY === null || groundY > bestGroundY) {
+      bestGroundY = groundY;
+    }
+  }
+
+  return bestGroundY;
+}
+
+function moveWithCollision(character, displacement, meshes) {
+  _remaining.copy(displacement);
+  if (_remaining.lengthSq() < 0.000001) return;
+
+  const heights = [0.42, CHARACTER_HEIGHT * 0.52, CHARACTER_HEIGHT * 0.85];
+
+  for (let pass = 0; pass < 2; pass += 1) {
+    const distance = _remaining.length();
+    if (distance < 0.0001) break;
+
+    _direction.copy(_remaining).normalize();
+    let closestHit = null;
+
+    for (const height of heights) {
+      _origin.copy(character.position).add(new THREE.Vector3(0, height, 0));
+
+      _wallRaycaster.set(_origin, _direction);
+      _wallRaycaster.near = 0;
+      _wallRaycaster.far = distance + CHARACTER_RADIUS;
+
+      const hits = _wallRaycaster.intersectObjects(meshes, false);
+
+      for (const hit of hits) {
+        if (!hit.face) continue;
+
+        _normal
+          .copy(hit.face.normal)
+          .transformDirection(hit.object.matrixWorld);
+
+        if (Math.abs(_normal.y) > 0.55) continue;
+
+        if (!closestHit || hit.distance < closestHit.distance) {
+          closestHit = hit;
+        }
+        break;
+      }
+    }
+
+    if (!closestHit) {
+      character.position.add(_remaining);
+      _remaining.set(0, 0, 0);
+      break;
+    }
+
+    _normal
+      .copy(closestHit.face.normal)
+      .transformDirection(closestHit.object.matrixWorld);
+
+    _normal.y = 0;
+    _normal.normalize();
+
+    if (_normal.dot(_direction) > 0) {
+      _normal.negate();
+    }
+
+    const allowedDistance = Math.max(0, closestHit.distance - CHARACTER_RADIUS);
+
+    _travel
+      .copy(_direction)
+      .multiplyScalar(Math.min(distance, allowedDistance));
+
+    character.position.add(_travel);
+    _remaining.sub(_travel);
+
+    const intoWall = _remaining.dot(_normal);
+    if (intoWall < 0) {
+      _remaining.addScaledVector(_normal, -intoWall);
+    }
+  }
+}
+
+function pushOutFromCar(character, car) {
+  if (!car) return;
+  const dx = character.position.x - car.position.x;
+  const dz = character.position.z - car.position.z;
+  const dy = Math.abs(character.position.y - car.position.y);
+  if (dy > 2.2) return;
+
+  const yaw = car.rotation.y;
+  const cosY = Math.cos(yaw);
+  const sinY = Math.sin(yaw);
+
+  const localX = dx * cosY - dz * sinY;
+  const localZ = dx * sinY + dz * cosY;
+
+  const halfL = CAR_COLLISION_HALF_LEN + CHARACTER_RADIUS;
+  const halfW = CAR_COLLISION_HALF_WID + CHARACTER_RADIUS;
+
+  if (Math.abs(localX) < halfL && Math.abs(localZ) < halfW) {
+    const overlapX = halfL - Math.abs(localX);
+    const overlapZ = halfW - Math.abs(localZ);
+
+    let pushLocalX = 0;
+    let pushLocalZ = 0;
+    if (overlapX < overlapZ) {
+      pushLocalX = localX >= 0 ? overlapX : -overlapX;
+    } else {
+      pushLocalZ = localZ >= 0 ? overlapZ : -overlapZ;
+    }
+
+    character.position.x += pushLocalX * cosY + pushLocalZ * sinY;
+    character.position.z += -pushLocalX * sinY + pushLocalZ * cosY;
+  }
+}
+
+function selectAnimation({
+  airborne,
+  hasInput,
+  sprinting,
+  running,
+  crouching,
+  speed,
+}) {
+  if (airborne) return "jump";
+
+  if (crouching) {
+    return speed > 0.2 ? "crouchWalk" : "crouchIdle";
+  }
+
+  if (!hasInput || speed < 0.2) {
+    return "idle";
+  }
+
+  if (sprinting) return "sprint";
+  if (running) return "run";
+
+  return "walk";
+}
+
+/* ------------------------------------------------------------------ */
+/* Character controller                                               */
+/* ------------------------------------------------------------------ */
+
 export default function CharacterController({
   characterRef,
+  carRef,
   collidersRef,
   enabled,
   emoteActive = false,
+  cameraYawRef,
+  remoteInputRef,
   onAnimationChange,
   onEmote,
   onPositionUpdate,
 }) {
   const keys = useRef(Object.create(null));
   const velocity = useRef(new THREE.Vector3());
+
   const airborne = useRef(false);
+  const grounded = useRef(false);
+
   const jumpWasDown = useRef(false);
-  const raycaster = useRef(new THREE.Raycaster());
+  const jumpBufferTimer = useRef(0);
+  const coyoteTimer = useRef(0);
+
   const enabledRef = useRef(enabled);
   const emoteRef = useRef(emoteActive);
+
+  const nearbyCache = useRef({
+    source: null,
+    position: new THREE.Vector3(Infinity, Infinity, Infinity),
+    meshes: [],
+  });
+
+  const lastAnimation = useRef("");
 
   enabledRef.current = enabled;
   emoteRef.current = emoteActive;
 
   useEffect(() => {
-    const normalize = (key) => (key === " " ? "space" : key.toLowerCase());
-
     const onKeyDown = (event) => {
-      const key = normalize(event.key);
+      const key = normalizeKey(event.key);
       if (!enabledRef.current) return;
 
-      if (/^[1-6]$/.test(key)) {
-        event.preventDefault();
-        if (!emoteRef.current) onEmote?.(key);
+      if (
+        event.target?.tagName === "INPUT" ||
+        event.target?.tagName === "TEXTAREA"
+      ) {
         return;
       }
 
-      if (CONTROL_KEYS.has(key)) {
+      if (/^[1-6]$/.test(key)) {
         event.preventDefault();
-        keys.current[key] = true;
+        if (!emoteRef.current) {
+          onEmote?.(key);
+        }
+        return;
       }
+
+      if (!CONTROL_KEYS.has(key)) return;
+      event.preventDefault();
+
+      if (key === "space" && !keys.current.space) {
+        jumpBufferTimer.current = JUMP_BUFFER;
+      }
+
+      keys.current[key] = true;
     };
 
     const onKeyUp = (event) => {
-      keys.current[normalize(event.key)] = false;
+      const key = normalizeKey(event.key);
+      keys.current[key] = false;
     };
 
     const clearKeys = () => {
       keys.current = Object.create(null);
       jumpWasDown.current = false;
+      jumpBufferTimer.current = 0;
     };
 
     window.addEventListener("keydown", onKeyDown, { passive: false });
     window.addEventListener("keyup", onKeyUp);
     window.addEventListener("blur", clearKeys);
+
     return () => {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
@@ -1520,7 +1914,12 @@ export default function CharacterController({
     if (!enabled) {
       keys.current = Object.create(null);
       velocity.current.set(0, 0, 0);
+      airborne.current = false;
+      grounded.current = false;
       jumpWasDown.current = false;
+      jumpBufferTimer.current = 0;
+      coyoteTimer.current = 0;
+      lastAnimation.current = "";
     }
   }, [enabled]);
 
@@ -1528,81 +1927,250 @@ export default function CharacterController({
     const character = characterRef?.current;
     if (!enabled || !character) return;
 
-    const dt = Math.min(rawDelta, 0.05);
+    const dt = Math.min(rawDelta, 0.04);
+    if (dt <= 0) return;
+
     const input = keys.current;
-    const forward =
+    const remote = remoteInputRef?.current;
+    const v = velocity.current;
+
+    const colliderEntries = collidersRef?.current;
+    const meshes = getNearbyMeshes(
+      nearbyCache.current,
+      colliderEntries,
+      character.position,
+    );
+
+    /* ---------------------------------------------------------- */
+    /* Combine Keyboard + Joystick + Continuous Auto-Run Input    */
+    /* ---------------------------------------------------------- */
+
+    const kbForward =
       (input.w || input.arrowup ? 1 : 0) - (input.s || input.arrowdown ? 1 : 0);
-    const strafe =
+    const kbStrafe =
       (input.d || input.arrowright ? 1 : 0) -
       (input.a || input.arrowleft ? 1 : 0);
-    const direction = new THREE.Vector3(strafe, 0, -forward);
-    const moving = direction.lengthSq() > 0 && !emoteActive;
 
-    if (moving) {
-      direction.normalize();
-      const targetYaw = Math.atan2(direction.x, direction.z);
-      const turnAlpha = 1 - Math.exp(-14 * dt);
-      let angleDelta = targetYaw - character.rotation.y;
-      angleDelta = Math.atan2(Math.sin(angleDelta), Math.cos(angleDelta));
-      character.rotation.y += angleDelta * turnAlpha;
+    const joyMoveY =
+      remote && Math.abs(remote.moveY || 0) > 0.04 ? remote.moveY : 0;
+    const joyMoveX =
+      remote && Math.abs(remote.moveX || 0) > 0.04 ? remote.moveX : 0;
 
-      const sprinting = Boolean(input.shift);
-      const speed = sprinting ? RUN_SPEED : WALK_SPEED;
-      character.position.x += direction.x * speed * dt;
-      character.position.z += direction.z * speed * dt;
-      onAnimationChange?.(sprinting ? "run" : "walk");
-    } else if (!emoteActive) {
-      onAnimationChange?.("idle");
+    const autoRunActive = Boolean(remote?.autoRun);
+
+    // If Auto-Run is active, move straight forward (+1) unless joystick Y overrides it
+    const joyForward = joyMoveY !== 0 ? joyMoveY : autoRunActive ? 1 : 0;
+    const joyStrafe = joyMoveX;
+
+    const forwardInput = kbForward !== 0 ? kbForward : joyForward;
+    const strafeInput = kbStrafe !== 0 ? kbStrafe : joyStrafe;
+
+    const camYaw = cameraYawRef?.current ?? 0;
+
+    _cameraForward.set(-Math.sin(camYaw), 0, -Math.cos(camYaw));
+    _cameraRight.set(Math.cos(camYaw), 0, -Math.sin(camYaw));
+
+    _wishDirection.set(0, 0, 0);
+    _wishDirection.addScaledVector(_cameraForward, forwardInput);
+    _wishDirection.addScaledVector(_cameraRight, strafeInput);
+
+    const inputMagnitude = Math.min(1, _wishDirection.length());
+    const hasInput = inputMagnitude > 0.04 && !emoteActive;
+
+    if (hasInput) {
+      _wishDirection.normalize();
     }
 
-    // Ground ray uses the same BVH mesh list supplied by OpenWorldMap.
-    const colliderEntries = collidersRef?.current;
-    let groundY = DEFAULT_GROUND_Y;
-    let foundGround = false;
+    /* ---------------------------------------------------------- */
+    /* Movement modes                                             */
+    /* ---------------------------------------------------------- */
 
-    if (colliderEntries?.ready && colliderEntries.length) {
-      const meshes = colliderEntries.map((entry) => entry.mesh).filter(Boolean);
-      const origin = new THREE.Vector3(
-        character.position.x,
-        character.position.y + 50,
-        character.position.z,
-      );
-      raycaster.current.set(origin, DOWN);
-      raycaster.current.far = 150;
-      const hits = raycaster.current.intersectObjects(meshes, false);
-      const groundHit = hits.find(
-        (hit) => hit.face && hit.face.normal.y > -0.5,
-      );
-      if (groundHit) {
-        groundY = groundHit.point.y;
-        foundGround = true;
-      }
+    const crouching = Boolean(input.c || input.control || remote?.crouch);
+    const sprinting = Boolean(input.shift || remote?.sprint) && !crouching;
+    const running =
+      (Boolean(input.alt) || autoRunActive || inputMagnitude > 0.72) &&
+      !sprinting &&
+      !crouching;
+
+    let targetSpeed = WALK_SPEED;
+    if (crouching) {
+      targetSpeed = CROUCH_SPEED;
+    } else if (sprinting) {
+      targetSpeed = SPRINT_SPEED;
+    } else if (running) {
+      targetSpeed = RUN_SPEED;
     }
 
-    const grounded = foundGround
-      ? character.position.y <= groundY + 0.06
-      : character.position.y <= DEFAULT_GROUND_Y + 0.02;
+    // Joystick allows fine, slow in-place stepping when tilted slightly
+    const effectiveSpeed =
+      kbForward !== 0 || kbStrafe !== 0 || autoRunActive
+        ? targetSpeed
+        : targetSpeed * Math.max(0.28, inputMagnitude);
 
-    if (grounded) {
-      character.position.y = foundGround ? groundY : DEFAULT_GROUND_Y;
-      velocity.current.y = 0;
-      airborne.current = false;
+    /* ---------------------------------------------------------- */
+    /* Horizontal acceleration                                    */
+    /* ---------------------------------------------------------- */
 
-      const jumpDown = Boolean(input.space) && !emoteActive;
-      if (jumpDown && !jumpWasDown.current) {
-        velocity.current.y = JUMP_FORCE;
-        airborne.current = true;
+    _horizontalVelocity.set(v.x, 0, v.z);
+
+    if (hasInput) {
+      const targetVelocity = _wishDirection
+        .clone()
+        .multiplyScalar(effectiveSpeed);
+      const difference = targetVelocity.sub(_horizontalVelocity);
+      const acceleration = airborne.current ? AIR_ACCEL : GROUND_ACCEL;
+      const maxChange = acceleration * dt;
+
+      if (difference.length() > maxChange) {
+        difference.setLength(maxChange);
       }
-      jumpWasDown.current = jumpDown;
+
+      _horizontalVelocity.add(difference);
     } else {
-      airborne.current = true;
-      jumpWasDown.current = Boolean(input.space);
+      const currentSpeed = _horizontalVelocity.length();
+      if (currentSpeed > 0) {
+        const deceleration = airborne.current ? AIR_ACCEL : GROUND_DECEL;
+        const drop = Math.min(currentSpeed, deceleration * dt);
+        _horizontalVelocity.multiplyScalar(
+          (currentSpeed - drop) / currentSpeed,
+        );
+      }
     }
+
+    v.x = _horizontalVelocity.x;
+    v.z = _horizontalVelocity.z;
+
+    /* ---------------------------------------------------------- */
+    /* Character facing                                           */
+    /* ---------------------------------------------------------- */
+
+    if (hasInput) {
+      const targetYaw = Math.atan2(_wishDirection.x, _wishDirection.z);
+
+      let angleDifference = targetYaw - character.rotation.y;
+      angleDifference = Math.atan2(
+        Math.sin(angleDifference),
+        Math.cos(angleDifference),
+      );
+
+      const turnAlpha = 1 - Math.exp(-TURN_RATE * dt);
+      character.rotation.y += angleDifference * turnAlpha;
+    }
+
+    /* ---------------------------------------------------------- */
+    /* Horizontal movement and wall + car collision               */
+    /* ---------------------------------------------------------- */
+
+    _movement.set(v.x * dt, 0, v.z * dt);
+
+    if (meshes.length) {
+      moveWithCollision(character, _movement, meshes);
+    } else {
+      character.position.add(_movement);
+    }
+
+    if (carRef?.current) {
+      pushOutFromCar(character, carRef.current);
+    }
+
+    /* ---------------------------------------------------------- */
+    /* Ground detection                                           */
+    /* ---------------------------------------------------------- */
+
+    let groundY = DEFAULT_GROUND_Y;
+
+    if (meshes.length) {
+      const detectedGround = findGround(character, meshes);
+      if (detectedGround !== null) {
+        groundY = detectedGround;
+      } else {
+        groundY = carRef?.current ? carRef.current.position.y : null;
+      }
+    }
+
+    const wasGrounded = grounded.current;
+
+    const canStandOnGround =
+      groundY !== null &&
+      v.y <= 0 &&
+      character.position.y <= groundY + STEP_HEIGHT;
+
+    if (canStandOnGround) {
+      character.position.y = groundY;
+      v.y = 0;
+      grounded.current = true;
+      airborne.current = false;
+      coyoteTimer.current = COYOTE_TIME;
+    } else {
+      grounded.current = false;
+      airborne.current = true;
+      coyoteTimer.current = Math.max(0, coyoteTimer.current - dt);
+    }
+
+    /* ---------------------------------------------------------- */
+    /* Jump buffering and coyote time                             */
+    /* ---------------------------------------------------------- */
+
+    const jumpDown = Boolean(input.space || remote?.jump) && !emoteActive;
+
+    if (jumpDown && !jumpWasDown.current) {
+      jumpBufferTimer.current = JUMP_BUFFER;
+    }
+
+    jumpWasDown.current = jumpDown;
+    jumpBufferTimer.current = Math.max(0, jumpBufferTimer.current - dt);
+
+    const canJump = grounded.current || coyoteTimer.current > 0;
+
+    if (jumpBufferTimer.current > 0 && canJump && !emoteActive) {
+      v.y = JUMP_FORCE;
+      grounded.current = false;
+      airborne.current = true;
+      jumpBufferTimer.current = 0;
+      coyoteTimer.current = 0;
+    }
+
+    /* ---------------------------------------------------------- */
+    /* Gravity and landing                                        */
+    /* ---------------------------------------------------------- */
 
     if (airborne.current) {
-      velocity.current.y -= GRAVITY * dt;
-      character.position.y += velocity.current.y * dt;
-      if (!emoteActive) onAnimationChange?.("jump");
+      v.y -= GRAVITY * dt;
+      character.position.y += v.y * dt;
+
+      if (groundY !== null && v.y <= 0 && character.position.y <= groundY) {
+        character.position.y = groundY;
+        v.y = 0;
+        airborne.current = false;
+        grounded.current = true;
+        coyoteTimer.current = COYOTE_TIME;
+      }
+    }
+
+    if (wasGrounded && !grounded.current) {
+      airborne.current = true;
+    }
+
+    /* ---------------------------------------------------------- */
+    /* Animation selection                                        */
+    /* ---------------------------------------------------------- */
+
+    const horizontalSpeed = Math.hypot(v.x, v.z);
+
+    if (!emoteActive) {
+      const nextAnimation = selectAnimation({
+        airborne: airborne.current,
+        hasInput,
+        sprinting,
+        running,
+        crouching,
+        speed: horizontalSpeed,
+      });
+
+      if (lastAnimation.current !== nextAnimation) {
+        lastAnimation.current = nextAnimation;
+        onAnimationChange?.(nextAnimation);
+      }
     }
 
     onPositionUpdate?.(character.position);
@@ -1617,8 +2185,9 @@ FILE: client/src/components/Character/CharacterModel.jsx
 ===============================================================================
 
 ```jsx
-import React, { forwardRef, useEffect, useMemo } from "react";
-import { useLoader } from "@react-three/fiber";
+
+import React, { forwardRef, useEffect, useMemo, useRef } from "react";
+import { useFrame, useLoader } from "@react-three/fiber";
 import { useAnimations, useFBX } from "@react-three/drei";
 import * as THREE from "three";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
@@ -1628,37 +2197,47 @@ import characterUrl from "../../assets/models/Characters/X Bot.fbx";
 
 export const CHARACTER_SCALE = 0.01;
 
-// CRA's context loader discovers any Mixamo FBX files added to this folder.
-// Keep X Bot.fbx as the character mesh; all other FBX files are animation clips.
+/* ------------------------------------------------------------------ */
+/* Discover animation files                                           */
+/* ------------------------------------------------------------------ */
+
 const animationContext = require.context(
   "../../assets/models/Characters",
   false,
   /\.fbx$/i,
 );
+
 const animationKeys = animationContext
   .keys()
   .filter((key) => !/x\s*bot\.fbx$/i.test(key));
+
 const animationUrls = animationKeys.map((key) => animationContext(key));
 
 const normalize = (value) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
 
 const ANIMATION_ALIASES = {
   idle: ["idle", "standingidle"],
-  walk: ["walk", "walking"],
-  run: ["run", "running"],
-  jump: ["jump", "jumping"],
-  wave: ["wave", "waving"],
-  dance: ["dance", "hiphopdancing", "breakdance"],
-  salute: ["salute"],
-  celebrate: ["celebrate", "celebration", "victory"],
-  point: ["point", "pointing"],
-  sit: ["sit", "sittingidle", "sitting"],
-  enterCar: ["entercar", "gettingintoacar", "enteringcar", "walk", "walking"],
-  exitCar: ["exitcar", "gettingoutofacar", "exitingcar", "walk", "walking"],
+  walk: ["walking", "walk"],
+  run: ["running", "run"],
+  sprint: ["sprint", "running", "run"],
+  backward: ["walkingbackwards", "walkbackwards", "backwardwalking"],
+  strafeLeft: ["leftstrafe", "strafingleft"],
+  strafeRight: ["rightstrafe", "strafingright", "leftstrafe"],
+  crouchIdle: ["crouchingidle", "crouchidle"],
+  crouchWalk: ["crouchwalk", "crouchingwalk"],
+  jump: ["jumping", "jump"],
+  wave: ["wave", "waving", "idle"],
+  dance: ["MacarenaDance", "hiphopdancing", "breakdance", "crouchwalk"],
+  salute: ["salute", "jumping"],
+  celebrate: ["celebrate", "celebration", "victory", "jumping"],
+  point: ["point", "pointing", "crouchingidle"],
+  sit: ["sit", "sittingidle", "sitting", "crouchingidle"],
+  drivingSeat: ["driving"],
+  enterCar: ["enteringcar"],
+  exitCar: ["exitingcar"],
 };
 
 const ONE_SHOT = new Set([
-  "jump",
   "wave",
   "dance",
   "salute",
@@ -1669,31 +2248,68 @@ const ONE_SHOT = new Set([
   "exitCar",
 ]);
 
+const MISSING_CLIP_FALLBACK_MS = 650;
+
+/**
+ * Mixamo FBX animations bake horizontal root motion into the Hips position track,
+ * which makes the character mesh drift away from its collider and snap back.
+ * Lock X and Z on the Hips position track to keep animations in-place.
+ */
+function stripRootMotion(clip) {
+  clip.tracks.forEach((track) => {
+    if (/hips\.position$/i.test(track.name)) {
+      const values = track.values;
+      const baseX = values[0] || 0;
+      const baseZ = values[2] || 0;
+      for (let i = 0; i < values.length; i += 3) {
+        values[i] = baseX;
+        values[i + 2] = baseZ;
+      }
+    }
+  });
+  return clip;
+}
+
 const CharacterModel = forwardRef(function CharacterModel(
-  { animation = "idle", visible = true, onAnimationFinished },
+  {
+    animation = "idle",
+    visible = true,
+    steerValue = 0,
+    onAnimationFinished,
+    onAnimationProgress,
+  },
   forwardedRef,
 ) {
   const sourceCharacter = useFBX(characterUrl);
+
   const character = useMemo(
     () => cloneSkeleton(sourceCharacter),
     [sourceCharacter],
   );
+
+  const bonesRef = useMemo(() => ({}), []);
+  const activeAnimationRef = useRef(null);
+
   const animationModels = useLoader(FBXLoader, animationUrls);
 
   const clips = useMemo(() => {
     const output = [];
+
     animationModels.forEach((fbx, index) => {
-      const key = animationKeys[index];
-      const fileName = key
+      const filePath = animationKeys[index];
+      const fileName = filePath
         .split("/")
         .pop()
         .replace(/\.fbx$/i, "");
-      const clip = fbx.animations?.[0];
-      if (!clip) return;
-      const cloned = clip.clone();
-      cloned.name = normalize(fileName);
-      output.push(cloned);
+
+      const sourceClip = fbx.animations?.[0];
+      if (!sourceClip) return;
+
+      const clip = stripRootMotion(sourceClip.clone());
+      clip.name = normalize(fileName);
+      output.push(clip);
     });
+
     return output;
   }, [animationModels]);
 
@@ -1701,57 +2317,134 @@ const CharacterModel = forwardRef(function CharacterModel(
 
   useEffect(() => {
     character.traverse((node) => {
+      if (node.isBone) {
+        bonesRef[node.name] = node;
+      }
       if (!node.isMesh) return;
+
       node.castShadow = true;
       node.receiveShadow = true;
       node.frustumCulled = false;
+
+      if (node.material) {
+        const materials = Array.isArray(node.material)
+          ? node.material
+          : [node.material];
+
+        materials.forEach((material) => {
+          if (!material) return;
+          material.side = THREE.FrontSide;
+          material.needsUpdate = true;
+        });
+      }
     });
+  }, [character, bonesRef]);
+
+  useEffect(() => {
+    // Rotate the inner FBX model by +90 deg so local +X is forward (matching CarController),
+    // or keep standard Mixamo +Z and let CharacterController align rotation.
+    character.rotation.set(0, 0, 0);
   }, [character]);
 
   useEffect(() => {
     const aliases = ANIMATION_ALIASES[animation] || [normalize(animation)];
+
     let action = null;
+
     for (const alias of aliases) {
-      action = actions[alias];
-      if (action) break;
+      if (actions[alias]) {
+        action = actions[alias];
+        break;
+      }
     }
 
-    // No matching clip: stop the previous action and leave the rig in its
-    // authored rest pose rather than playing an unrelated animation.
     Object.values(actions).forEach((candidate) => {
-      if (candidate && candidate !== action) candidate.fadeOut(0.18);
+      if (candidate && candidate !== action) {
+        candidate.fadeOut(0.15);
+      }
     });
 
-    if (!action) return undefined;
+    if (!action) {
+      console.error(
+        `[CharacterModel] Animation not found: ${animation}`,
+        Object.keys(actions),
+      );
+
+      if (ONE_SHOT.has(animation)) {
+        const timer = window.setTimeout(() => {
+          onAnimationFinished?.(animation);
+        }, MISSING_CLIP_FALLBACK_MS);
+
+        return () => window.clearTimeout(timer);
+      }
+
+      return undefined;
+    }
 
     const oneShot = ONE_SHOT.has(animation);
+
     action.reset();
     action.enabled = true;
+    action.paused = false;
     action.clampWhenFinished = oneShot;
+    action.timeScale = 1;
+
     action.setLoop(
       oneShot ? THREE.LoopOnce : THREE.LoopRepeat,
       oneShot ? 1 : Infinity,
     );
-    action.fadeIn(0.18).play();
 
-    let finishTimer;
+    console.log("[Character Animation]", {
+      requested: animation,
+      selected: action.getClip().name,
+      duration: action.getClip().duration,
+      oneShot,
+    });
+
+    const handleFinished = (event) => {
+      if (event.action !== action) return;
+      onAnimationFinished?.(animation);
+    };
+
     if (oneShot) {
-      const duration = action.getClip().duration || 1.2;
-      finishTimer = window.setTimeout(
-        () => {
-          onAnimationFinished?.(animation);
-        },
-        Math.max(350, duration * 1000),
-      );
+      mixer.addEventListener("finished", handleFinished);
     }
 
+    activeAnimationRef.current = { animation, action };
+    onAnimationProgress?.(animation, 0);
+    action.fadeIn(0.2).play();
+
     return () => {
-      if (finishTimer) window.clearTimeout(finishTimer);
+      if (activeAnimationRef.current?.action === action) {
+        activeAnimationRef.current = null;
+      }
+      if (oneShot) {
+        mixer.removeEventListener("finished", handleFinished);
+      }
+
+      action.fadeOut(0.15);
     };
-  }, [animation, actions, onAnimationFinished]);
+  }, [animation, actions, mixer, onAnimationFinished, onAnimationProgress]);
+
+  // Publish the live Mixamo clip progress for synchronized vehicle animation.
+  useFrame(() => {
+    const active = activeAnimationRef.current;
+    if (!active) return;
+
+    const duration = active.action.getClip().duration;
+    if (!duration || duration <= 0) return;
+
+    const progress = THREE.MathUtils.clamp(active.action.time / duration, 0, 1);
+
+    onAnimationProgress?.(active.animation, progress);
+  });
+
+  // Apply seated driving posture when inside the car
 
   useEffect(() => {
-    return () => mixer.stopAllAction();
+    return () => {
+      mixer.stopAllAction();
+    };
   }, [mixer]);
 
   return (
@@ -1783,6 +2476,13 @@ import Icons from "../UI/Icons";
 import HoldButton from "../UI/HoldButton";
 import SteeringWheelGraphic from "../UI/SteeringWheelGraphic";
 
+const CONTROLLER_EMOTES = [
+  { id: "wave", label: "WAVE" },
+  { id: "dance", label: "DANCE" },
+  { id: "salute", label: "SALUTE" },
+  { id: "celebrate", label: "WIN" },
+];
+
 export default function PhoneControllerApp() {
   const [connected, setConnected] = useState(false);
   const [steerMode, setSteerMode] = useState("wheel");
@@ -1796,12 +2496,21 @@ export default function PhoneControllerApp() {
   const [gyroSensorDetected, setGyroSensorDetected] = useState(false);
   const [steerVal, setSteerVal] = useState(0);
   const [wheelGrabbed, setWheelGrabbed] = useState(false);
+  const [joyKnob, setJoyKnob] = useState({ x: 0, y: 0, active: false });
+  const [autoRun, setAutoRun] = useState(false);
+  const [swipeIndicator, setSwipeIndicator] = useState({
+    active: false,
+    offset: 0,
+  });
+
   const [telemetry, setTelemetry] = useState({
     speed: 0,
     gear: "N",
     rpm: 850,
     drifting: false,
     boost: false,
+    playerMode: "driving",
+    nearCar: false,
   });
 
   const [isPortraitViewport, setIsPortraitViewport] = useState(() =>
@@ -1817,11 +2526,21 @@ export default function PhoneControllerApp() {
     handbrake: false,
     boost: false,
     jump: false,
+    crouch: false,
+    sprint: false,
+    autoRun: false,
     steer: 0,
+    moveX: 0,
+    moveY: 0,
+    lookX: 0,
+    lookY: 0,
   });
   const rawTiltRef = useRef(0);
   const tiltZeroRef = useRef(0);
   const wheelBoxRef = useRef(null);
+  const joyBoxRef = useRef(null);
+  const swipeBoxRef = useRef(null);
+  const prevSwipePtRef = useRef(null);
   const prevFingerAngleRef = useRef(null);
   const wheelAngleDegRef = useRef(0);
 
@@ -1842,17 +2561,30 @@ export default function PhoneControllerApp() {
     };
   }, []);
 
-  const emitInput = useCallback(() => {
-    socketRef.current?.emit("controller:input", inputRef.current);
+  const emitInput = useCallback((extra = undefined) => {
+    const payload = extra
+      ? { ...inputRef.current, ...extra }
+      : inputRef.current;
+    socketRef.current?.emit("controller:input", payload);
   }, []);
 
   useEffect(() => {
     const socket = io(getSocketUrl(), { transports: ["websocket", "polling"] });
     socketRef.current = socket;
 
-    socket.on("connect", () => setConnected(true));
+    socket.on("connect", () => {
+      setConnected(true);
+      socket.emit("controller:action", "syncState");
+    });
     socket.on("disconnect", () => setConnected(false));
-    socket.on("game:telemetry", (data) => setTelemetry(data));
+    socket.on("game:telemetry", (data) => {
+      if (!data) return;
+      setTelemetry((prev) => ({
+        ...prev,
+        ...data,
+        playerMode: data.playerMode || prev.playerMode,
+      }));
+    });
     socket.on("game:haptic", (pattern) => {
       if (typeof navigator !== "undefined" && navigator.vibrate) {
         navigator.vibrate(pattern);
@@ -1871,6 +2603,26 @@ export default function PhoneControllerApp() {
     };
   }, []);
 
+  // Automatically clear stale inputs when switching between Car HUD and Character HUD
+  useEffect(() => {
+    if (telemetry.playerMode === "driving") {
+      setAutoRun(false);
+      inputRef.current.autoRun = false;
+      inputRef.current.moveX = 0;
+      inputRef.current.moveY = 0;
+      inputRef.current.sprint = false;
+      inputRef.current.crouch = false;
+      setJoyKnob({ x: 0, y: 0, active: false });
+    } else if (telemetry.playerMode === "onFoot") {
+      inputRef.current.accelerate = false;
+      inputRef.current.brake = false;
+      inputRef.current.handbrake = false;
+      inputRef.current.boost = false;
+      inputRef.current.steer = 0;
+      setSteerVal(0);
+    }
+  }, [telemetry.playerMode]);
+
   const updateField = useCallback(
     (key, value) => {
       inputRef.current[key] = value;
@@ -1878,6 +2630,145 @@ export default function PhoneControllerApp() {
     },
     [emitInput],
   );
+
+  const toggleAutoRun = useCallback(() => {
+    setAutoRun((prev) => {
+      const next = !prev;
+      inputRef.current.autoRun = next;
+      if (typeof navigator !== "undefined" && navigator.vibrate) {
+        navigator.vibrate(20);
+      }
+      emitInput();
+      return next;
+    });
+  }, [emitInput]);
+
+  /* Left Joystick for Small / In-Place Movements */
+  const mapTouchDelta = useCallback(
+    (el, clientX, clientY) => {
+      const rect = el.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      let dx = clientX - cx;
+      let dy = clientY - cy;
+
+      if (isPortraitViewport) {
+        const temp = dx;
+        dx = dy;
+        dy = -temp;
+      }
+
+      const maxR = Math.min(rect.width, rect.height) * 0.38;
+      const dist = Math.hypot(dx, dy);
+      if (dist > maxR) {
+        dx = (dx / dist) * maxR;
+        dy = (dy / dist) * maxR;
+      }
+
+      return {
+        dx,
+        dy,
+        normX: THREE.MathUtils.clamp(dx / maxR, -1, 1),
+        normY: THREE.MathUtils.clamp(-dy / maxR, -1, 1),
+      };
+    },
+    [isPortraitViewport],
+  );
+
+  const handleMoveJoyUpdate = useCallback(
+    (e) => {
+      if (e.cancelable) e.preventDefault();
+      e.stopPropagation();
+      const el = joyBoxRef.current;
+      if (!el) return;
+      const pt = e.targetTouches?.[0] || e.touches?.[0] || e;
+      const { dx, dy, normX, normY } = mapTouchDelta(
+        el,
+        pt.clientX,
+        pt.clientY,
+      );
+      inputRef.current.moveX = normX;
+      inputRef.current.moveY = normY;
+
+      // Pulling backward on the joystick stops continuous auto-run
+      if (normY < -0.35 && inputRef.current.autoRun) {
+        inputRef.current.autoRun = false;
+        setAutoRun(false);
+      }
+
+      setJoyKnob({ x: dx, y: dy, active: true });
+      emitInput();
+    },
+    [mapTouchDelta, emitInput],
+  );
+
+  const handleMoveJoyEnd = useCallback(
+    (e) => {
+      if (e && e.cancelable) e.preventDefault();
+      inputRef.current.moveX = 0;
+      inputRef.current.moveY = 0;
+      setJoyKnob({ x: 0, y: 0, active: false });
+      emitInput();
+    },
+    [emitInput],
+  );
+
+  /* Right Horizontal Swipe Pad for Turning Character Direction */
+  const extractLandscapeXY = useCallback(
+    (pt) => {
+      if (isPortraitViewport) {
+        return { x: pt.clientY, y: -pt.clientX };
+      }
+      return { x: pt.clientX, y: pt.clientY };
+    },
+    [isPortraitViewport],
+  );
+
+  const handleSwipeStart = useCallback(
+    (e) => {
+      if (e.cancelable) e.preventDefault();
+      e.stopPropagation();
+      const pt = e.targetTouches?.[0] || e.touches?.[0] || e;
+      const pos = extractLandscapeXY(pt);
+      prevSwipePtRef.current = { x: pos.x, y: pos.y, startX: pos.x };
+      setSwipeIndicator({ active: true, offset: 0 });
+    },
+    [extractLandscapeXY],
+  );
+
+  const handleSwipeMove = useCallback(
+    (e) => {
+      if (!prevSwipePtRef.current) return;
+      if (e.cancelable) e.preventDefault();
+      e.stopPropagation();
+      const pt = e.targetTouches?.[0] || e.touches?.[0] || e;
+      const pos = extractLandscapeXY(pt);
+
+      const deltaX = pos.x - prevSwipePtRef.current.x;
+      const deltaY = pos.y - prevSwipePtRef.current.y;
+      prevSwipePtRef.current.x = pos.x;
+      prevSwipePtRef.current.y = pos.y;
+
+      const visualOffset = THREE.MathUtils.clamp(
+        pos.x - prevSwipePtRef.current.startX,
+        -58,
+        58,
+      );
+      setSwipeIndicator({ active: true, offset: visualOffset });
+
+      emitInput({
+        lookDeltaX: deltaX * 0.012,
+        lookDeltaY: deltaY * 0.006,
+      });
+    },
+    [extractLandscapeXY, emitInput],
+  );
+
+  const handleSwipeEnd = useCallback((e) => {
+    if (e && e.cancelable) e.preventDefault();
+    prevSwipePtRef.current = null;
+    setSwipeIndicator({ active: false, offset: 0 });
+  }, []);
 
   const openGyroPrompt = useCallback(() => {
     setSteerMode("tilt");
@@ -2076,6 +2967,8 @@ export default function PhoneControllerApp() {
     socketRef.current?.emit("controller:settings", { scenePreset: presetKey });
   }, []);
 
+  const isOnFoot =
+    telemetry.playerMode === "onFoot" || telemetry.playerMode === "exiting";
   const rpmRatio = Math.min(1, (telemetry.rpm || 850) / 7500);
   const ledCount = 14;
   const activeLeds = Math.round(rpmRatio * ledCount);
@@ -2114,9 +3007,11 @@ export default function PhoneControllerApp() {
               </span>
             </div>
             <div className="mc-sub-mode">
-              {steerMode === "tilt"
-                ? "GYRO TILT · L: BRAKE | R: ACCEL"
-                : `WHEEL (${steerSide.toUpperCase()}) · CIRCULAR TOUCH`}
+              {isOnFoot
+                ? "ON FOOT · JOYSTICK + AUTO-RUN + SWIPE TURN"
+                : steerMode === "tilt"
+                  ? "GYRO TILT · L: BRAKE | R: ACCEL"
+                  : `WHEEL (${steerSide.toUpperCase()}) · CIRCULAR TOUCH`}
             </div>
           </div>
         </div>
@@ -2130,12 +3025,25 @@ export default function PhoneControllerApp() {
           </div>
           <div className="mc-cluster-divider" />
           <div className="mc-gear-block">
-            <span className="mc-gear-label">GEAR</span>
-            <span className="mc-gear-digit">{telemetry.gear || "N"}</span>
+            <span className="mc-gear-label">MODE</span>
+            <span className="mc-gear-digit">
+              {isOnFoot ? (autoRun ? "RUN" : "WALK") : telemetry.gear || "N"}
+            </span>
           </div>
         </div>
 
         <div className="mc-icon-toolbar">
+          <button
+            type="button"
+            className="mc-icon-btn mc-action-pill"
+            onClick={() =>
+              socketRef.current?.emit("controller:action", "toggleVehicle")
+            }
+            title="Enter / Exit Car"
+          >
+            {isOnFoot ? "ENTER CAR" : "EXIT CAR"}
+          </button>
+
           <button
             type="button"
             className="mc-icon-btn"
@@ -2178,234 +3086,392 @@ export default function PhoneControllerApp() {
         </div>
       </header>
 
-      <button
-        type="button"
-        className="mc-jump-btn mc-jump-floating"
-        onPointerDown={(event) => {
-          event.preventDefault();
-          updateField("jump", true);
-        }}
-        onPointerUp={() => updateField("jump", false)}
-        onPointerCancel={() => updateField("jump", false)}
-        onPointerLeave={() => updateField("jump", false)}
-      >
-        <span className="mc-jump-icon">↑</span>
-        <span>JUMP</span>
-      </button>
-
-      {steerMode === "tilt" ? (
-        <div className="mc-gyro-layout">
-          <div className="mc-gyro-side">
-            <HoldButton
-              className="mc-aux-btn mc-drift-btn"
-              activeClassName="is-pressed"
-              onChange={(v) => updateField("handbrake", v)}
-            >
-              <span className="mc-btn-icon">
-                <Icons.Drift />
-              </span>
-              <span className="mc-aux-label">DRIFT</span>
-            </HoldButton>
-
-            <HoldButton
-              className="mc-pedal mc-brake-pedal"
-              activeClassName="is-pressed"
-              onChange={(v) => updateField("brake", v)}
-            >
-              <div className="mc-pedal-treads">
-                <span />
-                <span />
-                <span />
-              </div>
-              <div className="mc-pedal-icon">
-                <Icons.BrakeDisc />
-              </div>
-              <div className="mc-pedal-title">BRAKE</div>
-              <div className="mc-pedal-sub">REVERSE</div>
-            </HoldButton>
-          </div>
-
-          <div className="mc-gyro-center-card">
-            <div className="mc-gyro-badge">
-              <Icons.Gyro />
-              <span>TILT PHONE TO STEER</span>
-            </div>
-
-            {!gyroActive ? (
-              <button
-                type="button"
-                className="mc-enable-gyro-action-btn"
-                onClick={openGyroPrompt}
-              >
-                ENABLE GYRO SENSORS
-              </button>
-            ) : (
-              <div className="mc-gyro-horizon">
-                <div
-                  className="mc-gyro-horizon-bar"
-                  style={{
-                    transform: `rotate(${Math.round(-steerVal * 35)}deg)`,
-                  }}
-                >
-                  <span className="mc-horizon-tip" />
-                  <span className="mc-horizon-center" />
-                  <span className="mc-horizon-tip" />
-                </div>
-                <div className="mc-gyro-angle-val">
-                  {steerVal > 0.04
-                    ? `LEFT ${Math.round(steerVal * 100)}%`
-                    : steerVal < -0.04
-                      ? `RIGHT ${Math.round(Math.abs(steerVal) * 100)}%`
-                      : "0° CENTER"}
-                </div>
-              </div>
-            )}
-
-            {gyroPermNeeded && (
-              <div className="mc-gyro-perm-warning">
-                PERMISSION DENIED. CHECK BROWSER HTTPS/PERMISSIONS.
-              </div>
-            )}
-
-            <button
-              type="button"
-              className="mc-recenter-pill"
-              onClick={calibrateTilt}
-            >
-              ZERO TILT (CENTER)
-            </button>
-          </div>
-
-          <div className="mc-gyro-side">
-            <HoldButton
-              className="mc-aux-btn mc-boost-btn"
-              activeClassName="is-pressed"
-              onChange={(v) => updateField("boost", v)}
-            >
-              <span className="mc-btn-icon">
-                <Icons.Boost />
-              </span>
-              <span className="mc-aux-label">M-BOOST</span>
-            </HoldButton>
-
-            <HoldButton
-              className="mc-pedal mc-gas-pedal"
-              activeClassName="is-pressed"
-              onChange={(v) => updateField("accelerate", v)}
-            >
-              <div className="mc-pedal-treads">
-                <span />
-                <span />
-                <span />
-              </div>
-              <div className="mc-pedal-icon">
-                <Icons.GasPedal />
-              </div>
-              <div className="mc-pedal-title">ACCEL</div>
-              <div className="mc-pedal-sub">THROTTLE</div>
-            </HoldButton>
-          </div>
-        </div>
-      ) : (
-        <div
-          className={
-            steerSide === "right"
-              ? "mc-wheel-layout wheel-on-right"
-              : "mc-wheel-layout wheel-on-left"
-          }
-        >
+      {isOnFoot ? (
+        <div className="mc-character-layout">
+          {/* Left Zone: Analog Joystick for Small / In-Place Movements */}
           <div
-            ref={wheelBoxRef}
-            className="mc-rotary-wheel-zone"
-            onTouchStart={handleWheelStart}
-            onTouchMove={handleWheelMove}
-            onTouchEnd={handleWheelEnd}
-            onTouchCancel={handleWheelEnd}
-            onMouseDown={handleWheelStart}
+            ref={joyBoxRef}
+            className="mc-joy-zone"
+            onTouchStart={handleMoveJoyUpdate}
+            onTouchMove={handleMoveJoyUpdate}
+            onTouchEnd={handleMoveJoyEnd}
+            onTouchCancel={handleMoveJoyEnd}
+            onMouseDown={handleMoveJoyUpdate}
             onMouseMove={(e) => {
-              if (e.buttons === 1) handleWheelMove(e);
+              if (e.buttons === 1) handleMoveJoyUpdate(e);
             }}
-            onMouseUp={handleWheelEnd}
-            onMouseLeave={handleWheelEnd}
+            onMouseUp={handleMoveJoyEnd}
+            onMouseLeave={handleMoveJoyEnd}
           >
-            <div className="mc-rotary-ring-guide">
-              <div className="mc-rotary-glow" />
-              <SteeringWheelGraphic
-                steerValue={steerVal}
-                activeGrab={wheelGrabbed}
+            <div className="mc-joy-ring">
+              <div
+                className={
+                  joyKnob.active ? "mc-joy-knob active" : "mc-joy-knob"
+                }
+                style={{
+                  transform: `translate(${joyKnob.x}px, ${joyKnob.y}px)`,
+                }}
               />
             </div>
-
             <div className="mc-rotary-footer">
-              <span className="mc-rotary-hint">CIRCULAR ROTATION</span>
+              <span className="mc-rotary-hint">FINE MOVE JOYSTICK</span>
               <span className="mc-rotary-deg">
-                {Math.round(-steerVal * MAX_WHEEL_ROTATION_DEG)}°
+                {Math.round(
+                  Math.hypot(inputRef.current.moveX, inputRef.current.moveY) *
+                    100,
+                )}
+                %
               </span>
             </div>
           </div>
 
-          <div className="mc-dual-pedals-zone">
-            <div className="mc-aux-row">
-              <HoldButton
-                className="mc-aux-btn mc-drift-btn"
-                activeClassName="is-pressed"
-                onChange={(v) => updateField("handbrake", v)}
-              >
-                <span className="mc-btn-icon">
-                  <Icons.Drift />
+          {/* Center Zone: Continuous Auto-Run Button + Sprint, Jump, Crouch, Enter Car, Emotes */}
+          <div className="mc-char-center-actions">
+            <button
+              type="button"
+              className={
+                autoRun ? "mc-autorun-btn is-running" : "mc-autorun-btn"
+              }
+              onClick={toggleAutoRun}
+            >
+              <span className="mc-autorun-dot" />
+              <div className="mc-autorun-text">
+                <span className="mc-autorun-title">
+                  {autoRun
+                    ? "RUNNING STRAIGHT (TAP TO STOP)"
+                    : "RUN CONTINUOUSLY"}
                 </span>
-                <span className="mc-aux-label">DRIFT</span>
-              </HoldButton>
+                <span className="mc-autorun-sub">
+                  SWIPE RIGHT PAD HORIZONTALLY TO STEER DIRECTION
+                </span>
+              </div>
+            </button>
 
+            <div className="mc-char-primary-grid">
               <HoldButton
                 className="mc-aux-btn mc-boost-btn"
                 activeClassName="is-pressed"
-                onChange={(v) => updateField("boost", v)}
+                onChange={(v) => updateField("sprint", v)}
               >
-                <span className="mc-btn-icon">
-                  <Icons.Boost />
-                </span>
-                <span className="mc-aux-label">M-BOOST</span>
+                <span className="mc-aux-label">SPRINT</span>
               </HoldButton>
+
+              <HoldButton
+                className="mc-aux-btn mc-drift-btn"
+                activeClassName="is-pressed"
+                onChange={(v) => updateField("jump", v)}
+              >
+                <span className="mc-aux-label">JUMP ↑</span>
+              </HoldButton>
+
+              <HoldButton
+                className="mc-aux-btn mc-crouch-btn"
+                activeClassName="is-pressed"
+                onChange={(v) => updateField("crouch", v)}
+              >
+                <span className="mc-aux-label">CROUCH</span>
+              </HoldButton>
+
+              <button
+                type="button"
+                className={`mc-aux-btn mc-enter-car-btn ${telemetry.nearCar ? "ready" : ""}`}
+                onClick={() =>
+                  socketRef.current?.emit("controller:action", "toggleVehicle")
+                }
+              >
+                <span className="mc-aux-label">ENTER BMW</span>
+              </button>
             </div>
 
-            <div className="mc-pedals-pair">
-              <HoldButton
-                className="mc-pedal mc-brake-pedal"
-                activeClassName="is-pressed"
-                onChange={(v) => updateField("brake", v)}
-              >
-                <div className="mc-pedal-treads">
-                  <span />
-                  <span />
-                  <span />
-                </div>
-                <div className="mc-pedal-icon">
-                  <Icons.BrakeDisc />
-                </div>
-                <div className="mc-pedal-title">BRAKE</div>
-                <div className="mc-pedal-sub">REVERSE</div>
-              </HoldButton>
+            <div className="mc-char-emote-row">
+              {CONTROLLER_EMOTES.map((emote) => (
+                <button
+                  key={emote.id}
+                  type="button"
+                  className="mc-mini-emote-btn"
+                  onClick={() =>
+                    socketRef.current?.emit(
+                      "controller:action",
+                      `emote:${emote.id}`,
+                    )
+                  }
+                >
+                  {emote.label}
+                </button>
+              ))}
+            </div>
+          </div>
 
-              <HoldButton
-                className="mc-pedal mc-gas-pedal"
-                activeClassName="is-pressed"
-                onChange={(v) => updateField("accelerate", v)}
-              >
-                <div className="mc-pedal-treads">
-                  <span />
-                  <span />
-                  <span />
-                </div>
-                <div className="mc-pedal-icon">
-                  <Icons.GasPedal />
-                </div>
-                <div className="mc-pedal-title">ACCEL</div>
-                <div className="mc-pedal-sub">THROTTLE</div>
-              </HoldButton>
+          {/* Right Zone: Horizontal Swipe Trackpad for Turning Direction */}
+          <div
+            ref={swipeBoxRef}
+            className="mc-swipe-turn-zone"
+            onTouchStart={handleSwipeStart}
+            onTouchMove={handleSwipeMove}
+            onTouchEnd={handleSwipeEnd}
+            onTouchCancel={handleSwipeEnd}
+            onMouseDown={handleSwipeStart}
+            onMouseMove={(e) => {
+              if (e.buttons === 1) handleSwipeMove(e);
+            }}
+            onMouseUp={handleSwipeEnd}
+            onMouseLeave={handleSwipeEnd}
+          >
+            <div className="mc-swipe-header">SWIPE HORIZONTALLY TO TURN</div>
+
+            <div className="mc-swipe-track">
+              <span className="mc-swipe-arrow">‹‹ LEFT</span>
+              <div
+                className={
+                  swipeIndicator.active
+                    ? "mc-swipe-puck active"
+                    : "mc-swipe-puck"
+                }
+                style={{
+                  transform: `translateX(${swipeIndicator.offset}px)`,
+                }}
+              />
+              <span className="mc-swipe-arrow">RIGHT ››</span>
+            </div>
+
+            <div className="mc-rotary-footer">
+              <span className="mc-rotary-hint">DIRECTION TRACKPAD</span>
+              <span className="mc-rotary-deg">360° TURN</span>
             </div>
           </div>
         </div>
+      ) : (
+        <>
+          <button
+            type="button"
+            className="mc-jump-btn mc-jump-floating"
+            onPointerDown={(event) => {
+              event.preventDefault();
+              updateField("jump", true);
+            }}
+            onPointerUp={() => updateField("jump", false)}
+            onPointerCancel={() => updateField("jump", false)}
+            onPointerLeave={() => updateField("jump", false)}
+          >
+            <span className="mc-jump-icon">↑</span>
+            <span>JUMP</span>
+          </button>
+
+          {steerMode === "tilt" ? (
+            <div className="mc-gyro-layout">
+              <div className="mc-gyro-side">
+                <HoldButton
+                  className="mc-aux-btn mc-drift-btn"
+                  activeClassName="is-pressed"
+                  onChange={(v) => updateField("handbrake", v)}
+                >
+                  <span className="mc-btn-icon">
+                    <Icons.Drift />
+                  </span>
+                  <span className="mc-aux-label">DRIFT</span>
+                </HoldButton>
+
+                <HoldButton
+                  className="mc-pedal mc-brake-pedal"
+                  activeClassName="is-pressed"
+                  onChange={(v) => updateField("brake", v)}
+                >
+                  <div className="mc-pedal-treads">
+                    <span />
+                    <span />
+                    <span />
+                  </div>
+                  <div className="mc-pedal-icon">
+                    <Icons.BrakeDisc />
+                  </div>
+                  <div className="mc-pedal-title">BRAKE</div>
+                  <div className="mc-pedal-sub">REVERSE</div>
+                </HoldButton>
+              </div>
+
+              <div className="mc-gyro-center-card">
+                <div className="mc-gyro-badge">
+                  <Icons.Gyro />
+                  <span>TILT PHONE TO STEER</span>
+                </div>
+
+                {!gyroActive ? (
+                  <button
+                    type="button"
+                    className="mc-enable-gyro-action-btn"
+                    onClick={openGyroPrompt}
+                  >
+                    ENABLE GYRO SENSORS
+                  </button>
+                ) : (
+                  <div className="mc-gyro-horizon">
+                    <div
+                      className="mc-gyro-horizon-bar"
+                      style={{
+                        transform: `rotate(${Math.round(-steerVal * 35)}deg)`,
+                      }}
+                    >
+                      <span className="mc-horizon-tip" />
+                      <span className="mc-horizon-center" />
+                      <span className="mc-horizon-tip" />
+                    </div>
+                    <div className="mc-gyro-angle-val">
+                      {steerVal > 0.04
+                        ? `LEFT ${Math.round(steerVal * 100)}%`
+                        : steerVal < -0.04
+                          ? `RIGHT ${Math.round(Math.abs(steerVal) * 100)}%`
+                          : "0° CENTER"}
+                    </div>
+                  </div>
+                )}
+
+                {gyroPermNeeded && (
+                  <div className="mc-gyro-perm-warning">
+                    PERMISSION DENIED. CHECK BROWSER HTTPS/PERMISSIONS.
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  className="mc-recenter-pill"
+                  onClick={calibrateTilt}
+                >
+                  ZERO TILT (CENTER)
+                </button>
+              </div>
+
+              <div className="mc-gyro-side">
+                <HoldButton
+                  className="mc-aux-btn mc-boost-btn"
+                  activeClassName="is-pressed"
+                  onChange={(v) => updateField("boost", v)}
+                >
+                  <span className="mc-btn-icon">
+                    <Icons.Boost />
+                  </span>
+                  <span className="mc-aux-label">M-BOOST</span>
+                </HoldButton>
+
+                <HoldButton
+                  className="mc-pedal mc-gas-pedal"
+                  activeClassName="is-pressed"
+                  onChange={(v) => updateField("accelerate", v)}
+                >
+                  <div className="mc-pedal-treads">
+                    <span />
+                    <span />
+                    <span />
+                  </div>
+                  <div className="mc-pedal-icon">
+                    <Icons.GasPedal />
+                  </div>
+                  <div className="mc-pedal-title">ACCEL</div>
+                  <div className="mc-pedal-sub">THROTTLE</div>
+                </HoldButton>
+              </div>
+            </div>
+          ) : (
+            <div
+              className={
+                steerSide === "right"
+                  ? "mc-wheel-layout wheel-on-right"
+                  : "mc-wheel-layout wheel-on-left"
+              }
+            >
+              <div
+                ref={wheelBoxRef}
+                className="mc-rotary-wheel-zone"
+                onTouchStart={handleWheelStart}
+                onTouchMove={handleWheelMove}
+                onTouchEnd={handleWheelEnd}
+                onTouchCancel={handleWheelEnd}
+                onMouseDown={handleWheelStart}
+                onMouseMove={(e) => {
+                  if (e.buttons === 1) handleWheelMove(e);
+                }}
+                onMouseUp={handleWheelEnd}
+                onMouseLeave={handleWheelEnd}
+              >
+                <div className="mc-rotary-ring-guide">
+                  <div className="mc-rotary-glow" />
+                  <SteeringWheelGraphic
+                    steerValue={steerVal}
+                    activeGrab={wheelGrabbed}
+                  />
+                </div>
+
+                <div className="mc-rotary-footer">
+                  <span className="mc-rotary-hint">CIRCULAR ROTATION</span>
+                  <span className="mc-rotary-deg">
+                    {Math.round(-steerVal * MAX_WHEEL_ROTATION_DEG)}°
+                  </span>
+                </div>
+              </div>
+
+              <div className="mc-dual-pedals-zone">
+                <div className="mc-aux-row">
+                  <HoldButton
+                    className="mc-aux-btn mc-drift-btn"
+                    activeClassName="is-pressed"
+                    onChange={(v) => updateField("handbrake", v)}
+                  >
+                    <span className="mc-btn-icon">
+                      <Icons.Drift />
+                    </span>
+                    <span className="mc-aux-label">DRIFT</span>
+                  </HoldButton>
+
+                  <HoldButton
+                    className="mc-aux-btn mc-boost-btn"
+                    activeClassName="is-pressed"
+                    onChange={(v) => updateField("boost", v)}
+                  >
+                    <span className="mc-btn-icon">
+                      <Icons.Boost />
+                    </span>
+                    <span className="mc-aux-label">M-BOOST</span>
+                  </HoldButton>
+                </div>
+
+                <div className="mc-pedals-pair">
+                  <HoldButton
+                    className="mc-pedal mc-brake-pedal"
+                    activeClassName="is-pressed"
+                    onChange={(v) => updateField("brake", v)}
+                  >
+                    <div className="mc-pedal-treads">
+                      <span />
+                      <span />
+                      <span />
+                    </div>
+                    <div className="mc-pedal-icon">
+                      <Icons.BrakeDisc />
+                    </div>
+                    <div className="mc-pedal-title">BRAKE</div>
+                    <div className="mc-pedal-sub">REVERSE</div>
+                  </HoldButton>
+
+                  <HoldButton
+                    className="mc-pedal mc-gas-pedal"
+                    activeClassName="is-pressed"
+                    onChange={(v) => updateField("accelerate", v)}
+                  >
+                    <div className="mc-pedal-treads">
+                      <span />
+                      <span />
+                      <span />
+                    </div>
+                    <div className="mc-pedal-icon">
+                      <Icons.GasPedal />
+                    </div>
+                    <div className="mc-pedal-title">ACCEL</div>
+                    <div className="mc-pedal-sub">THROTTLE</div>
+                  </HoldButton>
+                </div>
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       {settingsOpen && (
@@ -2578,7 +3644,7 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { Canvas } from "@react-three/fiber";
+import { Canvas, useFrame } from "@react-three/fiber";
 import { PerspectiveCamera, Loader } from "@react-three/drei";
 import * as THREE from "three";
 import { io } from "socket.io-client";
@@ -2594,17 +3660,18 @@ import DrivingWorld from "../World/DrivingWorld";
 import FollowCamera from "../World/FollowCamera";
 import BMWM4 from "../Car/BMWM4";
 import CarController from "../Car/CarController";
-import CharacterModel from "../Character/CharacterModel";
+import CharacterModel, { CHARACTER_SCALE } from "../Character/CharacterModel";
 import CharacterController from "../Character/CharacterController";
 import Icons from "../UI/Icons";
 import SteeringWheelGraphic from "../UI/SteeringWheelGraphic";
 import SportSpeedometer from "../UI/SportSpeedometer";
 import { GameSettingsModal, QrConnectModal } from "../UI/GameModals";
 
-const DRIVER_DOOR_OFFSET = new THREE.Vector3(-0.25, 0, 1.42);
-const INTERACTION_DISTANCE = 3.4;
-const MAX_ENTER_SPEED_KMH = 2.5;
-const TRANSITION_FALLBACK_MS = 1600;
+// Car faces +X when yaw = 0, so Left (driver side) is -Z
+const DRIVER_DOOR_OFFSET = new THREE.Vector3(0.05, 0, -1.35);
+const DRIVER_SEAT_OFFSET = new THREE.Vector3(-0.08, 0.18, -0.34);
+const INTERACTION_DISTANCE = 3.6;
+const MAX_ENTER_SPEED_KMH = 5.0;
 
 const EMOTES = [
   { key: "1", id: "wave", label: "Wave" },
@@ -2615,14 +3682,75 @@ const EMOTES = [
   { key: "6", id: "sit", label: "Sit" },
 ];
 
-function getDriverDoorPosition(car, target = new THREE.Vector3()) {
+const UP_AXIS = new THREE.Vector3(0, 1, 0);
+
+function getCarWorldPoint(car, localOffset, target = new THREE.Vector3()) {
   if (!car) return target.set(0, 0, 0);
-  const yaw = car.rotation.y;
-  target
-    .copy(DRIVER_DOOR_OFFSET)
-    .applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+  target.copy(localOffset).applyAxisAngle(UP_AXIS, car.rotation.y);
   target.add(car.position);
   return target;
+}
+
+/**
+ * Keeps the character model seated inside the car while driving,
+ * and smoothly interpolates the character through the open door during enter/exit.
+ */
+function VehicleOccupantSync({
+  carRef,
+  characterRef,
+  playerMode,
+  doorProgressRef,
+}) {
+  const doorPos = useRef(new THREE.Vector3());
+  const seatPos = useRef(new THREE.Vector3());
+
+  useFrame(() => {
+    const car = carRef.current;
+    const character = characterRef.current;
+    if (!car || !character) return;
+
+    const forwardSeatYaw = car.rotation.y + Math.PI / 2;
+
+    if (playerMode === "driving") {
+      getCarWorldPoint(car, DRIVER_SEAT_OFFSET, seatPos.current);
+      character.position.copy(seatPos.current);
+      character.rotation.set(car.rotation.x, forwardSeatYaw, car.rotation.z);
+      character.scale.setScalar(CHARACTER_SCALE * 0.86);
+      return;
+    }
+
+    if (playerMode === "entering" || playerMode === "exiting") {
+      const progress = THREE.MathUtils.clamp(
+        doorProgressRef?.current?.progress ?? 0,
+        0,
+        1,
+      );
+
+      getCarWorldPoint(car, DRIVER_DOOR_OFFSET, doorPos.current);
+      getCarWorldPoint(car, DRIVER_SEAT_OFFSET, seatPos.current);
+
+      if (playerMode === "entering") {
+        const moveT = THREE.MathUtils.smoothstep(progress, 0.32, 0.96);
+        character.position.lerpVectors(doorPos.current, seatPos.current, moveT);
+        character.rotation.set(0, forwardSeatYaw, 0);
+        character.scale.setScalar(
+          THREE.MathUtils.lerp(CHARACTER_SCALE, CHARACTER_SCALE * 0.86, moveT),
+        );
+      } else {
+        const moveT = THREE.MathUtils.smoothstep(progress, 0.28, 0.84);
+        character.position.lerpVectors(seatPos.current, doorPos.current, moveT);
+        character.rotation.set(0, forwardSeatYaw - moveT * 0.4, 0);
+        character.scale.setScalar(
+          THREE.MathUtils.lerp(CHARACTER_SCALE * 0.86, CHARACTER_SCALE, moveT),
+        );
+      }
+      return;
+    }
+
+    character.scale.setScalar(CHARACTER_SCALE);
+  });
+
+  return null;
 }
 
 export default function LaptopGameApp() {
@@ -2633,8 +3761,7 @@ export default function LaptopGameApp() {
   const [qrModalOpen, setQrModalOpen] = useState(false);
   const [phoneLinked, setPhoneLinked] = useState(false);
   const [playerMode, setPlayerMode] = useState("driving"); // driving | onFoot | entering | exiting
-  const [charAnimation, setCharAnimation] = useState("idle");
-  const [characterVisible, setCharacterVisible] = useState(false);
+  const [charAnimation, setCharAnimation] = useState("drivingSeat");
   const [nearCar, setNearCar] = useState(false);
   const [interactionMessage, setInteractionMessage] = useState("");
   const [emoteActive, setEmoteActive] = useState(false);
@@ -2646,8 +3773,13 @@ export default function LaptopGameApp() {
   const characterRef = useRef(null);
   const wheelAssembliesRef = useRef([]);
   const socketRef = useRef(null);
-  const transitionTimerRef = useRef(null);
+  const doorProgressRef = useRef({
+    animation: null,
+    progress: 0,
+  });
   const interactionPointRef = useRef(new THREE.Vector3());
+  const cameraYawRef = useRef(0);
+
   const physicsStateRef = useRef({
     vx: 0,
     vy: 0,
@@ -2655,13 +3787,23 @@ export default function LaptopGameApp() {
     isDrifting: false,
     boost: false,
   });
+
   const remoteInputRef = useRef({
     accelerate: false,
     brake: false,
     handbrake: false,
     boost: false,
     jump: false,
+    crouch: false,
+    sprint: false,
+    autoRun: false,
     steer: 0,
+    moveX: 0,
+    moveY: 0,
+    lookX: 0,
+    lookY: 0,
+    lookDeltaX: 0,
+    lookDeltaY: 0,
     reset: false,
   });
 
@@ -2676,7 +3818,16 @@ export default function LaptopGameApp() {
       handbrake: false,
       boost: false,
       jump: false,
+      crouch: false,
+      sprint: false,
+      autoRun: false,
       steer: 0,
+      moveX: 0,
+      moveY: 0,
+      lookX: 0,
+      lookY: 0,
+      lookDeltaX: 0,
+      lookDeltaY: 0,
     });
   }, []);
 
@@ -2689,14 +3840,28 @@ export default function LaptopGameApp() {
 
   const finishTransition = useCallback((expectedMode) => {
     if (expectedMode === "entering") {
-      setCharacterVisible(false);
       setPlayerMode("driving");
+      setCharAnimation("drivingSeat");
+      setInteractionMessage("");
     } else if (expectedMode === "exiting") {
+      if (carRef.current && characterRef.current) {
+        const door = getCarWorldPoint(
+          carRef.current,
+          DRIVER_DOOR_OFFSET,
+          interactionPointRef.current,
+        );
+        characterRef.current.position.copy(door);
+        characterRef.current.rotation.set(
+          0,
+          carRef.current.rotation.y + Math.PI / 2,
+          0,
+        );
+      }
       setPlayerMode("onFoot");
       setCharAnimation("idle");
+      setInteractionMessage("");
     }
     setEmoteActive(false);
-    transitionTimerRef.current = null;
   }, []);
 
   const enterVehicle = useCallback(() => {
@@ -2713,23 +3878,19 @@ export default function LaptopGameApp() {
     }
 
     clearRemoteInput();
-    const door = getDriverDoorPosition(
+    const door = getCarWorldPoint(
       carRef.current,
+      DRIVER_DOOR_OFFSET,
       interactionPointRef.current,
     );
     characterRef.current.position.copy(door);
     characterRef.current.rotation.y = carRef.current.rotation.y + Math.PI / 2;
+
+    doorProgressRef.current = { animation: "enterCar", progress: 0 };
     setEmoteActive(false);
     setCharAnimation("enterCar");
     setPlayerMode("entering");
-    setInteractionMessage("Entering BMW M4...");
-
-    if (transitionTimerRef.current)
-      window.clearTimeout(transitionTimerRef.current);
-    transitionTimerRef.current = window.setTimeout(
-      () => finishTransition("entering"),
-      TRANSITION_FALLBACK_MS,
-    );
+    setInteractionMessage("Opening door & entering BMW M4...");
   }, [playerMode, nearCar, speedKmh, clearRemoteInput, finishTransition]);
 
   const exitVehicle = useCallback(() => {
@@ -2741,23 +3902,10 @@ export default function LaptopGameApp() {
     }
 
     clearRemoteInput();
-    const door = getDriverDoorPosition(
-      carRef.current,
-      interactionPointRef.current,
-    );
-    characterRef.current.position.copy(door);
-    characterRef.current.rotation.y = carRef.current.rotation.y + Math.PI / 2;
-    setCharacterVisible(true);
+    doorProgressRef.current = { animation: "exitCar", progress: 0 };
     setCharAnimation("exitCar");
     setPlayerMode("exiting");
-    setInteractionMessage("Exiting BMW M4...");
-
-    if (transitionTimerRef.current)
-      window.clearTimeout(transitionTimerRef.current);
-    transitionTimerRef.current = window.setTimeout(
-      () => finishTransition("exiting"),
-      TRANSITION_FALLBACK_MS,
-    );
+    setInteractionMessage("Opening door & exiting BMW M4...");
   }, [playerMode, speedKmh, clearRemoteInput, finishTransition]);
 
   const toggleVehicle = useCallback(() => {
@@ -2779,13 +3927,23 @@ export default function LaptopGameApp() {
     [playerMode, emoteActive],
   );
 
+  const handleAnimationProgress = useCallback((animation, progress) => {
+    if (animation !== "enterCar" && animation !== "exitCar") return;
+    doorProgressRef.current = {
+      animation,
+      progress: THREE.MathUtils.clamp(progress, 0, 1),
+    };
+  }, []);
+
   const handleCharacterAnimationFinished = useCallback(
     (finishedAnimation) => {
       if (finishedAnimation === "enterCar") {
+        doorProgressRef.current.progress = 1;
         finishTransition("entering");
         return;
       }
       if (finishedAnimation === "exitCar") {
+        doorProgressRef.current.progress = 1;
         finishTransition("exiting");
         return;
       }
@@ -2812,42 +3970,62 @@ export default function LaptopGameApp() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [toggleVehicle]);
 
-  // Keep the interaction prompt tied to the actual driver-side door, not the car centre.
+  // Immediately push mode changes to the phone so the Phone HUD switches with zero delay
+  useEffect(() => {
+    socketRef.current?.emit("game:telemetry", {
+      speed: telemetry.speed,
+      gear: telemetry.gear,
+      rpm: telemetry.rpm,
+      drifting: telemetry.drifting,
+      boost: telemetry.boost,
+      playerMode,
+      nearCar,
+    });
+  }, [playerMode, nearCar, telemetry]);
+
+  // Keep the interaction prompt and phone telemetry synced with driver-side door proximity
+  // Keep the interaction prompt and phone telemetry synced every 100ms in ALL modes
   useEffect(() => {
     const interval = window.setInterval(() => {
-      if (playerMode !== "onFoot" || !carRef.current || !characterRef.current) {
+      let canReach = false;
+
+      if (playerMode === "onFoot" && carRef.current && characterRef.current) {
+        const door = getCarWorldPoint(
+          carRef.current,
+          DRIVER_DOOR_OFFSET,
+          interactionPointRef.current,
+        );
+        const distance = characterRef.current.position.distanceTo(door);
+        canReach = distance <= INTERACTION_DISTANCE;
+        setNearCar(canReach);
+        setInteractionMessage(
+          canReach
+            ? speedKmh <= MAX_ENTER_SPEED_KMH
+              ? "Press F or Tap ENTER to get in BMW M4"
+              : "Stop the BMW to enter"
+            : "",
+        );
+      } else {
         setNearCar(false);
         if (playerMode === "driving") {
           setInteractionMessage(
             speedKmh > MAX_ENTER_SPEED_KMH ? "Brake and stop to exit" : "",
           );
         }
-        return;
       }
-      const door = getDriverDoorPosition(
-        carRef.current,
-        interactionPointRef.current,
-      );
-      const distance = characterRef.current.position.distanceTo(door);
-      const canReach = distance <= INTERACTION_DISTANCE;
-      setNearCar(canReach);
-      setInteractionMessage(
-        canReach
-          ? speedKmh <= MAX_ENTER_SPEED_KMH
-            ? "Press F to enter BMW M4"
-            : "Stop the BMW to enter"
-          : "",
-      );
-    }, 120);
-    return () => window.clearInterval(interval);
-  }, [playerMode, speedKmh]);
 
-  useEffect(() => {
-    return () => {
-      if (transitionTimerRef.current)
-        window.clearTimeout(transitionTimerRef.current);
-    };
-  }, []);
+      socketRef.current?.emit("game:telemetry", {
+        speed: telemetry.speed,
+        gear: telemetry.gear,
+        rpm: telemetry.rpm,
+        drifting: telemetry.drifting,
+        boost: telemetry.boost,
+        playerMode,
+        nearCar: canReach,
+      });
+    }, 100);
+    return () => window.clearInterval(interval);
+  }, [playerMode, speedKmh, telemetry]);
 
   useEffect(() => {
     const socket = io(getSocketUrl(), { transports: ["websocket", "polling"] });
@@ -2859,11 +4037,28 @@ export default function LaptopGameApp() {
       remoteInputRef.current.handbrake = Boolean(data.handbrake);
       remoteInputRef.current.boost = Boolean(data.boost);
       remoteInputRef.current.jump = Boolean(data.jump);
+      remoteInputRef.current.crouch = Boolean(data.crouch);
+      remoteInputRef.current.sprint = Boolean(data.sprint);
+      remoteInputRef.current.autoRun = Boolean(data.autoRun);
       remoteInputRef.current.steer = Number(data.steer) || 0;
+      remoteInputRef.current.moveX = Number(data.moveX) || 0;
+      remoteInputRef.current.moveY = Number(data.moveY) || 0;
+      remoteInputRef.current.lookX = Number(data.lookX) || 0;
+      remoteInputRef.current.lookY = Number(data.lookY) || 0;
+      if (data.lookDeltaX) {
+        remoteInputRef.current.lookDeltaX += Number(data.lookDeltaX) || 0;
+      }
+      if (data.lookDeltaY) {
+        remoteInputRef.current.lookDeltaY += Number(data.lookDeltaY) || 0;
+      }
     });
     socket.on("controller:action", (action) => {
       if (action === "camera") cycleCamera();
       if (action === "reset") remoteInputRef.current.reset = true;
+      if (action === "toggleVehicle") toggleVehicle();
+      if (typeof action === "string" && action.startsWith("emote:")) {
+        playEmote(action.split(":")[1]);
+      }
     });
     socket.on("controller:settings", (settings) => {
       if (settings.steerHudSide) setSteerHudSide(settings.steerHudSide);
@@ -2874,11 +4069,7 @@ export default function LaptopGameApp() {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [cycleCamera]);
-
-  useEffect(() => {
-    if (playerMode !== "driving") clearRemoteInput();
-  }, [playerMode, clearRemoteInput]);
+  }, [cycleCamera, toggleVehicle, playEmote]);
 
   const handleCollision = useCallback((impactSpeed) => {
     const intensity = Math.max(0, Math.min(1, impactSpeed / 28));
@@ -2892,16 +4083,21 @@ export default function LaptopGameApp() {
     ]);
   }, []);
 
-  const handleTelemetryChange = useCallback((nextTelemetry) => {
-    setTelemetry(nextTelemetry);
-    socketRef.current?.emit("game:telemetry", {
-      speed: nextTelemetry.speed,
-      gear: nextTelemetry.gear,
-      rpm: nextTelemetry.rpm,
-      drifting: nextTelemetry.drifting,
-      boost: nextTelemetry.boost,
-    });
-  }, []);
+  const handleTelemetryChange = useCallback(
+    (nextTelemetry) => {
+      setTelemetry(nextTelemetry);
+      socketRef.current?.emit("game:telemetry", {
+        speed: nextTelemetry.speed,
+        gear: nextTelemetry.gear,
+        rpm: nextTelemetry.rpm,
+        drifting: nextTelemetry.drifting,
+        boost: nextTelemetry.boost,
+        playerMode,
+        nearCar,
+      });
+    },
+    [playerMode, nearCar],
+  );
 
   const handleWheelsReady = useCallback((rigData) => {
     wheelAssembliesRef.current = rigData;
@@ -2948,16 +4144,25 @@ export default function LaptopGameApp() {
         <Suspense fallback={null}>
           <BMWM4
             ref={carRef}
+            doorProgressRef={doorProgressRef}
             onWheelsReady={handleWheelsReady}
             onError={handleModelError}
           />
           <CharacterModel
             ref={characterRef}
-            animation={charAnimation}
-            visible={characterVisible}
+            animation={playerMode === "driving" ? "drivingSeat" : charAnimation}
+            visible={true}
+            steerValue={currentSteer}
             onAnimationFinished={handleCharacterAnimationFinished}
+            onAnimationProgress={handleAnimationProgress}
           />
         </Suspense>
+        <VehicleOccupantSync
+          carRef={carRef}
+          characterRef={characterRef}
+          playerMode={playerMode}
+          doorProgressRef={doorProgressRef}
+        />
         <CarController
           carRef={carRef}
           wheelAssembliesRef={wheelAssembliesRef}
@@ -2970,20 +4175,26 @@ export default function LaptopGameApp() {
         />
         <CharacterController
           characterRef={characterRef}
+          carRef={carRef}
           collidersRef={collidersRef}
           enabled={playerMode === "onFoot"}
           emoteActive={emoteActive}
+          cameraYawRef={cameraYawRef}
+          remoteInputRef={remoteInputRef}
           onAnimationChange={setCharAnimation}
           onEmote={(key) => {
             const emote = EMOTES.find((item) => item.key === key);
             if (emote) playEmote(emote.id);
           }}
         />
+
         <FollowCamera
           targetRef={isCharacterMode ? characterRef : carRef}
           physicsStateRef={physicsStateRef}
+          remoteInputRef={remoteInputRef}
           cameraMode={cameraMode}
           isCharacterMode={isCharacterMode}
+          orbitYawRef={cameraYawRef}
         />
       </Canvas>
 
@@ -3001,26 +4212,30 @@ export default function LaptopGameApp() {
           {playerMode === "onFoot" ? (
             <button
               type="button"
-              className="mc-icon-btn"
+              className="mc-icon-btn mc-action-pill"
               onClick={enterVehicle}
               disabled={!nearCar || speedKmh > MAX_ENTER_SPEED_KMH}
-              title="Enter BMW M4"
+              title="Enter BMW M4 (F)"
             >
-              ENTER
+              ENTER CAR
             </button>
           ) : playerMode === "driving" ? (
             <button
               type="button"
-              className="mc-icon-btn"
+              className="mc-icon-btn mc-action-pill"
               onClick={exitVehicle}
               disabled={speedKmh > MAX_ENTER_SPEED_KMH}
-              title="Exit BMW M4"
+              title="Exit BMW M4 (F)"
             >
-              EXIT
+              EXIT CAR
             </button>
           ) : (
-            <button type="button" className="mc-icon-btn" disabled>
-              {playerMode === "entering" ? "ENTERING" : "EXITING"}
+            <button
+              type="button"
+              className="mc-icon-btn mc-action-pill"
+              disabled
+            >
+              {playerMode === "entering" ? "ENTERING..." : "EXITING..."}
             </button>
           )}
           <button
@@ -3111,13 +4326,21 @@ export default function LaptopGameApp() {
             ))}
           </div>
           <div className="character-control-hint">
-            WASD MOVE · SHIFT SPRINT · SPACE JUMP · 1–6 EMOTES · F ENTER
+            WASD / PHONE JOYSTICK MOVE · SWIPE PHONE / DRAG MOUSE TO TURN ·
+            SHIFT SPRINT · SPACE JUMP · F ENTER CAR
           </div>
         </section>
       )}
 
       {(interactionMessage || isTransitioning) && (
-        <div className="vehicle-interaction-prompt">
+        <div
+          className="vehicle-interaction-prompt"
+          style={{
+            pointerEvents: nearCar ? "auto" : "none",
+            cursor: nearCar ? "pointer" : "default",
+          }}
+          onClick={nearCar ? toggleVehicle : undefined}
+        >
           {interactionMessage || "Please wait..."}
         </div>
       )}
@@ -3700,23 +4923,141 @@ FILE: client/src/components/World/FollowCamera.jsx
 import { useEffect, useRef } from "react";
 import { useFrame, useThree } from "@react-three/fiber";
 import * as THREE from "three";
+
 import { CAMERA_MODES } from "../../config/gameConstants";
+
+const MOUSE_SENSITIVITY = 0.0028;
+const REMOTE_LOOK_SPEED = 2.4;
+
+const MIN_PITCH = -0.35;
+const MAX_PITCH = 0.9;
+
+const ORBIT_DAMP = 14;
+
+const CHARACTER_CAMERA_DISTANCE = 4.6;
+const CHARACTER_CAMERA_HEIGHT = 1.45;
 
 export default function FollowCamera({
   targetRef,
   carRef,
   physicsStateRef,
+  remoteInputRef,
   cameraMode,
   isCharacterMode,
+  orbitYawRef,
+  orbitPitchRef,
 }) {
-  const { camera } = useThree();
+  const { camera, gl } = useThree();
+
   const desiredPosition = useRef(new THREE.Vector3());
   const lookTarget = useRef(new THREE.Vector3());
   const currentLook = useRef(new THREE.Vector3());
   const previousMode = useRef(null);
+
   const activeTargetRef = targetRef || carRef;
+
   const camPreset =
     CAMERA_MODES.find((item) => item.id === cameraMode) || CAMERA_MODES[0];
+
+  const yaw = useRef(0);
+  const pitch = useRef(0.16);
+
+  const yawTarget = useRef(0);
+  const pitchTarget = useRef(0.16);
+
+  const dragging = useRef(false);
+  const lastX = useRef(0);
+  const lastY = useRef(0);
+  const pointerLocked = useRef(false);
+
+  useEffect(() => {
+    if (!isCharacterMode) {
+      dragging.current = false;
+      return undefined;
+    }
+
+    const element = gl.domElement;
+
+    const onPointerDown = (event) => {
+      if (pointerLocked.current) return;
+      if (event.button !== 0) return;
+
+      dragging.current = true;
+      lastX.current = event.clientX;
+      lastY.current = event.clientY;
+      element.setPointerCapture?.(event.pointerId);
+    };
+
+    const onPointerUp = (event) => {
+      dragging.current = false;
+      if (element.hasPointerCapture?.(event.pointerId)) {
+        element.releasePointerCapture?.(event.pointerId);
+      }
+    };
+
+    const onPointerMove = (event) => {
+      let deltaX = 0;
+      let deltaY = 0;
+
+      if (pointerLocked.current) {
+        deltaX = event.movementX;
+        deltaY = event.movementY;
+      } else {
+        if (!dragging.current) return;
+        deltaX = event.clientX - lastX.current;
+        deltaY = event.clientY - lastY.current;
+        lastX.current = event.clientX;
+        lastY.current = event.clientY;
+      }
+
+      yawTarget.current -= deltaX * MOUSE_SENSITIVITY;
+      pitchTarget.current = THREE.MathUtils.clamp(
+        pitchTarget.current + deltaY * MOUSE_SENSITIVITY,
+        MIN_PITCH,
+        MAX_PITCH,
+      );
+    };
+
+    const onDoubleClick = () => {
+      if (!pointerLocked.current && element.requestPointerLock) {
+        element.requestPointerLock();
+      }
+    };
+
+    const onPointerLockChange = () => {
+      pointerLocked.current = document.pointerLockElement === element;
+      if (pointerLocked.current) {
+        dragging.current = false;
+      }
+    };
+
+    const onWheel = (event) => {
+      event.preventDefault();
+    };
+
+    element.addEventListener("pointerdown", onPointerDown);
+    element.addEventListener("pointerup", onPointerUp);
+    element.addEventListener("pointermove", onPointerMove);
+    element.addEventListener("dblclick", onDoubleClick);
+    element.addEventListener("wheel", onWheel, { passive: false });
+    document.addEventListener("pointerlockchange", onPointerLockChange);
+
+    return () => {
+      element.removeEventListener("pointerdown", onPointerDown);
+      element.removeEventListener("pointerup", onPointerUp);
+      element.removeEventListener("pointermove", onPointerMove);
+      element.removeEventListener("dblclick", onDoubleClick);
+      element.removeEventListener("wheel", onWheel);
+      document.removeEventListener("pointerlockchange", onPointerLockChange);
+
+      if (pointerLocked.current && document.exitPointerLock) {
+        document.exitPointerLock();
+      }
+
+      pointerLocked.current = false;
+      dragging.current = false;
+    };
+  }, [gl, isCharacterMode]);
 
   useEffect(() => {
     previousMode.current = null;
@@ -3728,22 +5069,75 @@ export default function FollowCamera({
 
     const dt = Math.min(rawDelta, 0.05);
     const modeKey = isCharacterMode ? "character" : `car-${cameraMode}`;
+
     if (previousMode.current !== modeKey) {
       previousMode.current = modeKey;
+
       currentLook.current
         .copy(target.position)
-        .add(new THREE.Vector3(0, isCharacterMode ? 1.2 : 0.9, 0));
+        .add(new THREE.Vector3(0, isCharacterMode ? 1.3 : 0.9, 0));
+
+      if (isCharacterMode) {
+        const behindYaw = target.rotation.y + Math.PI;
+        yaw.current = behindYaw;
+        yawTarget.current = behindYaw;
+
+        pitch.current = 0.18;
+        pitchTarget.current = 0.18;
+      }
     }
 
     if (isCharacterMode) {
-      const offset = new THREE.Vector3(0, 2.25, -4.8);
-      offset.applyAxisAngle(new THREE.Vector3(0, 1, 0), target.rotation.y);
-      desiredPosition.current.copy(target.position).add(offset);
-      camera.position.lerp(desiredPosition.current, 1 - Math.exp(-7.5 * dt));
+      // Consume immediate horizontal swipe delta from phone trackpad
+      if (remoteInputRef?.current) {
+        const swipeDX = remoteInputRef.current.lookDeltaX || 0;
+        const swipeDY = remoteInputRef.current.lookDeltaY || 0;
+        if (swipeDX !== 0 || swipeDY !== 0) {
+          yawTarget.current -= swipeDX;
+          pitchTarget.current = THREE.MathUtils.clamp(
+            pitchTarget.current + swipeDY,
+            MIN_PITCH,
+            MAX_PITCH,
+          );
+          remoteInputRef.current.lookDeltaX = 0;
+          remoteInputRef.current.lookDeltaY = 0;
+        }
+      }
+
+      const remoteLookX = remoteInputRef?.current?.lookX || 0;
+      const remoteLookY = remoteInputRef?.current?.lookY || 0;
+      if (Math.abs(remoteLookX) > 0.04 || Math.abs(remoteLookY) > 0.04) {
+        yawTarget.current -= remoteLookX * REMOTE_LOOK_SPEED * dt;
+        pitchTarget.current = THREE.MathUtils.clamp(
+          pitchTarget.current - remoteLookY * REMOTE_LOOK_SPEED * 0.7 * dt,
+          MIN_PITCH,
+          MAX_PITCH,
+        );
+      }
+
+      const yawAlpha = 1 - Math.exp(-ORBIT_DAMP * dt);
+      yaw.current += (yawTarget.current - yaw.current) * yawAlpha;
+      pitch.current += (pitchTarget.current - pitch.current) * yawAlpha;
+
+      if (orbitYawRef) orbitYawRef.current = yaw.current;
+      if (orbitPitchRef) orbitPitchRef.current = pitch.current;
+
+      const distance = CHARACTER_CAMERA_DISTANCE;
+      const horizontal = Math.cos(pitch.current) * distance;
+      const vertical = Math.sin(pitch.current) * distance;
+
+      const cameraX = target.position.x + Math.sin(yaw.current) * horizontal;
+      const cameraZ = target.position.z + Math.cos(yaw.current) * horizontal;
+      const cameraY = target.position.y + CHARACTER_CAMERA_HEIGHT + vertical;
+
+      desiredPosition.current.set(cameraX, cameraY, cameraZ);
+      camera.position.lerp(desiredPosition.current, 1 - Math.exp(-12 * dt));
+
       lookTarget.current
         .copy(target.position)
-        .add(new THREE.Vector3(0, 1.2, 0));
-      currentLook.current.lerp(lookTarget.current, 1 - Math.exp(-11 * dt));
+        .add(new THREE.Vector3(0, 1.35, 0));
+
+      currentLook.current.lerp(lookTarget.current, 1 - Math.exp(-16 * dt));
       camera.lookAt(currentLook.current);
       return;
     }
@@ -3754,19 +5148,23 @@ export default function FollowCamera({
       steering: 0,
       boost: false,
     };
-    const yaw = target.rotation.y;
+
+    const carYaw = target.rotation.y;
 
     if (cameraMode === "hood") {
       const offset = new THREE.Vector3(...camPreset.offset).applyAxisAngle(
         new THREE.Vector3(0, 1, 0),
-        yaw,
+        carYaw,
       );
+
       camera.position.copy(target.position).add(offset);
+
       const look = new THREE.Vector3(
         12,
         camPreset.lookY,
         -phys.steering * 3,
-      ).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+      ).applyAxisAngle(new THREE.Vector3(0, 1, 0), carYaw);
+
       lookTarget.current.copy(target.position).add(look);
       camera.lookAt(lookTarget.current);
       return;
@@ -3778,11 +5176,13 @@ export default function FollowCamera({
       0,
       1.4,
     );
+
     const offset = new THREE.Vector3(
       camPreset.offset[0] - speedPullback,
       camPreset.offset[1],
       camPreset.offset[2] + driftSwing,
-    ).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+    ).applyAxisAngle(new THREE.Vector3(0, 1, 0), carYaw);
+
     desiredPosition.current.copy(target.position).add(offset);
     camera.position.lerp(desiredPosition.current, 1 - Math.exp(-6.5 * dt));
 
@@ -3790,7 +5190,8 @@ export default function FollowCamera({
       2.2,
       camPreset.lookY,
       -phys.steering * 1.1,
-    ).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+    ).applyAxisAngle(new THREE.Vector3(0, 1, 0), carYaw);
+
     lookTarget.current.copy(target.position).add(lookAhead);
     currentLook.current.lerp(lookTarget.current, 1 - Math.exp(-10 * dt));
     camera.lookAt(currentLook.current);
@@ -5394,6 +6795,323 @@ button {
     width: max-content;
     max-width: calc(100vw - 32px);
   }
+}
+/* ================================================================== */
+/*  VIRTUAL JOYSTICK & PHONE CHARACTER MODE                           */
+/* ================================================================== */
+
+.mc-action-pill {
+  width: auto;
+  padding: 0 12px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 1px;
+}
+
+.onscreen-joystick-zone {
+  position: absolute;
+  z-index: 8;
+  left: 34px;
+  bottom: 34px;
+  width: 146px;
+  height: 158px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  touch-action: none;
+  user-select: none;
+}
+
+.onscreen-joystick-ring {
+  width: 126px;
+  height: 126px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(0, 210, 255, 0.42);
+  background: radial-gradient(
+    circle,
+    rgba(23, 105, 210, 0.28) 0%,
+    rgba(8, 14, 24, 0.78) 100%
+  );
+  backdrop-filter: blur(10px);
+  display: grid;
+  place-items: center;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+
+.onscreen-joystick-SavedKnob {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: 2px solid #70e5ff;
+  background: linear-gradient(135deg, #2d79ff 0%, #00d2ff 100%);
+  box-shadow: 0 0 18px rgba(0, 210, 255, 0.65);
+  pointer-events: none;
+}
+
+.onscreen-joystick-label {
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 1.4px;
+  color: #8fa5be;
+}
+
+.mc-character-layout {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1.15fr 1fr;
+  gap: 12px;
+  align-items: stretch;
+  margin-top: 8px;
+  min-height: 0;
+}
+
+.mc-joy-zone {
+  border-radius: 20px;
+  border: 1px solid rgba(45, 121, 255, 0.32);
+  background: radial-gradient(
+    circle at 50% 45%,
+    rgba(23, 44, 78, 0.55) 0%,
+    rgba(8, 13, 21, 0.92) 100%
+  );
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  touch-action: none;
+}
+
+.mc-joy-ring {
+  width: min(155px, 44vh);
+  height: min(155px, 44vh);
+  border-radius: 50%;
+  border: 1.5px dashed rgba(0, 210, 255, 0.4);
+  background: radial-gradient(
+    circle,
+    rgba(45, 121, 255, 0.22) 0%,
+    rgba(6, 10, 18, 0.65) 75%
+  );
+  display: grid;
+  place-items: center;
+  margin: auto 0;
+}
+
+.mc-joy-ring.look-ring {
+  border-color: rgba(255, 159, 10, 0.42);
+}
+
+.mc-joy-knob {
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.65);
+  background: linear-gradient(145deg, #1769d2, #0b2e59);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+}
+
+.mc-joy-knob.active {
+  border-color: #00d2ff;
+  background: linear-gradient(145deg, #00d2ff, #1769d2);
+  box-shadow: 0 0 22px rgba(0, 210, 255, 0.75);
+}
+
+.mc-char-center-actions {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.mc-char-primary-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.mc-char-primary-grid .mc-aux-btn {
+  height: 100%;
+  min-height: 54px;
+}
+
+.mc-crouch-btn {
+  border: 1.5px solid rgba(165, 185, 215, 0.45);
+  background: rgba(25, 36, 52, 0.9);
+  color: #dce6f2;
+}
+
+.mc-crouch-btn.is-pressed {
+  transform: scale(0.95);
+  border-color: #ffffff;
+  background: #3a506b;
+}
+
+.mc-enter-car-btn {
+  border: 1.5px solid rgba(50, 215, 75, 0.45);
+  background: rgba(14, 48, 24, 0.85);
+  color: #72f288;
+}
+
+.mc-enter-car-btn.ready {
+  border-color: #32d74b;
+  background: linear-gradient(180deg, #28b83e 0%, #136b21 100%);
+  color: #ffffff;
+  box-shadow: 0 0 20px rgba(50, 215, 75, 0.55);
+}
+
+.mc-char-emote-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+.mc-mini-emote-btn {
+  height: 36px;
+  border-radius: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(18, 28, 44, 0.9);
+  color: #b8cae0;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+}
+
+.mc-mini-emote-btn:active {
+  background: #1769d2;
+  color: #ffffff;
+}
+
+/* ================================================================== */
+/*  AUTO-RUN BUTTON & HORIZONTAL SWIPE DIRECTION TRACKPAD             */
+/* ================================================================== */
+
+.mc-autorun-btn {
+  width: 100%;
+  padding: 10px 14px;
+  border-radius: 14px;
+  border: 1.5px solid rgba(0, 210, 255, 0.45);
+  background: linear-gradient(
+    180deg,
+    rgba(16, 38, 68, 0.9) 0%,
+    rgba(8, 20, 38, 0.96) 100%
+  );
+  color: #dce6f2;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.mc-autorun-btn.is-running {
+  border-color: #32d74b;
+  background: linear-gradient(135deg, #1b8a34 0%, #0e4f1e 100%);
+  color: #ffffff;
+  box-shadow: 0 0 24px rgba(50, 215, 75, 0.55);
+}
+
+.mc-autorun-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #6c809a;
+  flex-shrink: 0;
+}
+
+.mc-autorun-btn.is-running .mc-autorun-dot {
+  background: #32d74b;
+  box-shadow: 0 0 10px #ffffff;
+}
+
+.mc-autorun-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  gap: 2px;
+}
+
+.mc-autorun-title {
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: 1.2px;
+  line-height: 1;
+}
+
+.mc-autorun-sub {
+  font-size: 7px;
+  font-weight: 800;
+  letter-spacing: 0.9px;
+  opacity: 0.78;
+}
+
+.mc-swipe-turn-zone {
+  border-radius: 20px;
+  border: 1.5px solid rgba(255, 159, 10, 0.45);
+  background: radial-gradient(
+    circle at 50% 50%,
+    rgba(62, 38, 12, 0.5) 0%,
+    rgba(8, 13, 21, 0.94) 100%
+  );
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  touch-action: none;
+  user-select: none;
+}
+
+.mc-swipe-header {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 1.4px;
+  color: #ffbc57;
+}
+
+.mc-swipe-track {
+  width: 100%;
+  height: 74px;
+  border-radius: 999px;
+  border: 1.5px dashed rgba(255, 188, 87, 0.45);
+  background: rgba(12, 18, 28, 0.75);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  position: relative;
+  overflow: hidden;
+}
+
+.mc-swipe-arrow {
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 1.5px;
+  color: rgba(255, 188, 87, 0.55);
+  pointer-events: none;
+}
+
+.mc-swipe-puck {
+  position: absolute;
+  left: calc(50% - 27px);
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  border: 2px solid #ffbc57;
+  background: linear-gradient(145deg, #ff9f0a, #b85d00);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+  transition: transform 0.06s linear;
+}
+
+.mc-swipe-puck.active {
+  transition: none;
+  border-color: #ffffff;
+  box-shadow: 0 0 22px rgba(255, 159, 10, 0.85);
 }
 ```
 

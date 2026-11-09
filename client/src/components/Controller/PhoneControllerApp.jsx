@@ -12,6 +12,13 @@ import Icons from "../UI/Icons";
 import HoldButton from "../UI/HoldButton";
 import SteeringWheelGraphic from "../UI/SteeringWheelGraphic";
 
+const CONTROLLER_EMOTES = [
+  { id: "wave", label: "WAVE" },
+  { id: "dance", label: "DANCE" },
+  { id: "salute", label: "SALUTE" },
+  { id: "celebrate", label: "WIN" },
+];
+
 export default function PhoneControllerApp() {
   const [connected, setConnected] = useState(false);
   const [steerMode, setSteerMode] = useState("wheel");
@@ -25,12 +32,21 @@ export default function PhoneControllerApp() {
   const [gyroSensorDetected, setGyroSensorDetected] = useState(false);
   const [steerVal, setSteerVal] = useState(0);
   const [wheelGrabbed, setWheelGrabbed] = useState(false);
+  const [joyKnob, setJoyKnob] = useState({ x: 0, y: 0, active: false });
+  const [autoRun, setAutoRun] = useState(false);
+  const [swipeIndicator, setSwipeIndicator] = useState({
+    active: false,
+    offset: 0,
+  });
+
   const [telemetry, setTelemetry] = useState({
     speed: 0,
     gear: "N",
     rpm: 850,
     drifting: false,
     boost: false,
+    playerMode: "driving",
+    nearCar: false,
   });
 
   const [isPortraitViewport, setIsPortraitViewport] = useState(() =>
@@ -46,11 +62,21 @@ export default function PhoneControllerApp() {
     handbrake: false,
     boost: false,
     jump: false,
+    crouch: false,
+    sprint: false,
+    autoRun: false,
     steer: 0,
+    moveX: 0,
+    moveY: 0,
+    lookX: 0,
+    lookY: 0,
   });
   const rawTiltRef = useRef(0);
   const tiltZeroRef = useRef(0);
   const wheelBoxRef = useRef(null);
+  const joyBoxRef = useRef(null);
+  const swipeBoxRef = useRef(null);
+  const prevSwipePtRef = useRef(null);
   const prevFingerAngleRef = useRef(null);
   const wheelAngleDegRef = useRef(0);
 
@@ -71,17 +97,30 @@ export default function PhoneControllerApp() {
     };
   }, []);
 
-  const emitInput = useCallback(() => {
-    socketRef.current?.emit("controller:input", inputRef.current);
+  const emitInput = useCallback((extra = undefined) => {
+    const payload = extra
+      ? { ...inputRef.current, ...extra }
+      : inputRef.current;
+    socketRef.current?.emit("controller:input", payload);
   }, []);
 
   useEffect(() => {
     const socket = io(getSocketUrl(), { transports: ["websocket", "polling"] });
     socketRef.current = socket;
 
-    socket.on("connect", () => setConnected(true));
+    socket.on("connect", () => {
+      setConnected(true);
+      socket.emit("controller:action", "syncState");
+    });
     socket.on("disconnect", () => setConnected(false));
-    socket.on("game:telemetry", (data) => setTelemetry(data));
+    socket.on("game:telemetry", (data) => {
+      if (!data) return;
+      setTelemetry((prev) => ({
+        ...prev,
+        ...data,
+        playerMode: data.playerMode || prev.playerMode,
+      }));
+    });
     socket.on("game:haptic", (pattern) => {
       if (typeof navigator !== "undefined" && navigator.vibrate) {
         navigator.vibrate(pattern);
@@ -100,6 +139,26 @@ export default function PhoneControllerApp() {
     };
   }, []);
 
+  // Automatically clear stale inputs when switching between Car HUD and Character HUD
+  useEffect(() => {
+    if (telemetry.playerMode === "driving") {
+      setAutoRun(false);
+      inputRef.current.autoRun = false;
+      inputRef.current.moveX = 0;
+      inputRef.current.moveY = 0;
+      inputRef.current.sprint = false;
+      inputRef.current.crouch = false;
+      setJoyKnob({ x: 0, y: 0, active: false });
+    } else if (telemetry.playerMode === "onFoot") {
+      inputRef.current.accelerate = false;
+      inputRef.current.brake = false;
+      inputRef.current.handbrake = false;
+      inputRef.current.boost = false;
+      inputRef.current.steer = 0;
+      setSteerVal(0);
+    }
+  }, [telemetry.playerMode]);
+
   const updateField = useCallback(
     (key, value) => {
       inputRef.current[key] = value;
@@ -107,6 +166,145 @@ export default function PhoneControllerApp() {
     },
     [emitInput],
   );
+
+  const toggleAutoRun = useCallback(() => {
+    setAutoRun((prev) => {
+      const next = !prev;
+      inputRef.current.autoRun = next;
+      if (typeof navigator !== "undefined" && navigator.vibrate) {
+        navigator.vibrate(20);
+      }
+      emitInput();
+      return next;
+    });
+  }, [emitInput]);
+
+  /* Left Joystick for Small / In-Place Movements */
+  const mapTouchDelta = useCallback(
+    (el, clientX, clientY) => {
+      const rect = el.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      let dx = clientX - cx;
+      let dy = clientY - cy;
+
+      if (isPortraitViewport) {
+        const temp = dx;
+        dx = dy;
+        dy = -temp;
+      }
+
+      const maxR = Math.min(rect.width, rect.height) * 0.38;
+      const dist = Math.hypot(dx, dy);
+      if (dist > maxR) {
+        dx = (dx / dist) * maxR;
+        dy = (dy / dist) * maxR;
+      }
+
+      return {
+        dx,
+        dy,
+        normX: THREE.MathUtils.clamp(dx / maxR, -1, 1),
+        normY: THREE.MathUtils.clamp(-dy / maxR, -1, 1),
+      };
+    },
+    [isPortraitViewport],
+  );
+
+  const handleMoveJoyUpdate = useCallback(
+    (e) => {
+      if (e.cancelable) e.preventDefault();
+      e.stopPropagation();
+      const el = joyBoxRef.current;
+      if (!el) return;
+      const pt = e.targetTouches?.[0] || e.touches?.[0] || e;
+      const { dx, dy, normX, normY } = mapTouchDelta(
+        el,
+        pt.clientX,
+        pt.clientY,
+      );
+      inputRef.current.moveX = normX;
+      inputRef.current.moveY = normY;
+
+      // Pulling backward on the joystick stops continuous auto-run
+      if (normY < -0.35 && inputRef.current.autoRun) {
+        inputRef.current.autoRun = false;
+        setAutoRun(false);
+      }
+
+      setJoyKnob({ x: dx, y: dy, active: true });
+      emitInput();
+    },
+    [mapTouchDelta, emitInput],
+  );
+
+  const handleMoveJoyEnd = useCallback(
+    (e) => {
+      if (e && e.cancelable) e.preventDefault();
+      inputRef.current.moveX = 0;
+      inputRef.current.moveY = 0;
+      setJoyKnob({ x: 0, y: 0, active: false });
+      emitInput();
+    },
+    [emitInput],
+  );
+
+  /* Right Horizontal Swipe Pad for Turning Character Direction */
+  const extractLandscapeXY = useCallback(
+    (pt) => {
+      if (isPortraitViewport) {
+        return { x: pt.clientY, y: -pt.clientX };
+      }
+      return { x: pt.clientX, y: pt.clientY };
+    },
+    [isPortraitViewport],
+  );
+
+  const handleSwipeStart = useCallback(
+    (e) => {
+      if (e.cancelable) e.preventDefault();
+      e.stopPropagation();
+      const pt = e.targetTouches?.[0] || e.touches?.[0] || e;
+      const pos = extractLandscapeXY(pt);
+      prevSwipePtRef.current = { x: pos.x, y: pos.y, startX: pos.x };
+      setSwipeIndicator({ active: true, offset: 0 });
+    },
+    [extractLandscapeXY],
+  );
+
+  const handleSwipeMove = useCallback(
+    (e) => {
+      if (!prevSwipePtRef.current) return;
+      if (e.cancelable) e.preventDefault();
+      e.stopPropagation();
+      const pt = e.targetTouches?.[0] || e.touches?.[0] || e;
+      const pos = extractLandscapeXY(pt);
+
+      const deltaX = pos.x - prevSwipePtRef.current.x;
+      const deltaY = pos.y - prevSwipePtRef.current.y;
+      prevSwipePtRef.current.x = pos.x;
+      prevSwipePtRef.current.y = pos.y;
+
+      const visualOffset = THREE.MathUtils.clamp(
+        pos.x - prevSwipePtRef.current.startX,
+        -58,
+        58,
+      );
+      setSwipeIndicator({ active: true, offset: visualOffset });
+
+      emitInput({
+        lookDeltaX: deltaX * 0.012,
+        lookDeltaY: deltaY * 0.006,
+      });
+    },
+    [extractLandscapeXY, emitInput],
+  );
+
+  const handleSwipeEnd = useCallback((e) => {
+    if (e && e.cancelable) e.preventDefault();
+    prevSwipePtRef.current = null;
+    setSwipeIndicator({ active: false, offset: 0 });
+  }, []);
 
   const openGyroPrompt = useCallback(() => {
     setSteerMode("tilt");
@@ -305,6 +503,8 @@ export default function PhoneControllerApp() {
     socketRef.current?.emit("controller:settings", { scenePreset: presetKey });
   }, []);
 
+  const isOnFoot =
+    telemetry.playerMode === "onFoot" || telemetry.playerMode === "exiting";
   const rpmRatio = Math.min(1, (telemetry.rpm || 850) / 7500);
   const ledCount = 14;
   const activeLeds = Math.round(rpmRatio * ledCount);
@@ -343,9 +543,11 @@ export default function PhoneControllerApp() {
               </span>
             </div>
             <div className="mc-sub-mode">
-              {steerMode === "tilt"
-                ? "GYRO TILT · L: BRAKE | R: ACCEL"
-                : `WHEEL (${steerSide.toUpperCase()}) · CIRCULAR TOUCH`}
+              {isOnFoot
+                ? "ON FOOT · JOYSTICK + AUTO-RUN + SWIPE TURN"
+                : steerMode === "tilt"
+                  ? "GYRO TILT · L: BRAKE | R: ACCEL"
+                  : `WHEEL (${steerSide.toUpperCase()}) · CIRCULAR TOUCH`}
             </div>
           </div>
         </div>
@@ -359,12 +561,25 @@ export default function PhoneControllerApp() {
           </div>
           <div className="mc-cluster-divider" />
           <div className="mc-gear-block">
-            <span className="mc-gear-label">GEAR</span>
-            <span className="mc-gear-digit">{telemetry.gear || "N"}</span>
+            <span className="mc-gear-label">MODE</span>
+            <span className="mc-gear-digit">
+              {isOnFoot ? (autoRun ? "RUN" : "WALK") : telemetry.gear || "N"}
+            </span>
           </div>
         </div>
 
         <div className="mc-icon-toolbar">
+          <button
+            type="button"
+            className="mc-icon-btn mc-action-pill"
+            onClick={() =>
+              socketRef.current?.emit("controller:action", "toggleVehicle")
+            }
+            title="Enter / Exit Car"
+          >
+            {isOnFoot ? "ENTER CAR" : "EXIT CAR"}
+          </button>
+
           <button
             type="button"
             className="mc-icon-btn"
@@ -407,234 +622,392 @@ export default function PhoneControllerApp() {
         </div>
       </header>
 
-      <button
-        type="button"
-        className="mc-jump-btn mc-jump-floating"
-        onPointerDown={(event) => {
-          event.preventDefault();
-          updateField("jump", true);
-        }}
-        onPointerUp={() => updateField("jump", false)}
-        onPointerCancel={() => updateField("jump", false)}
-        onPointerLeave={() => updateField("jump", false)}
-      >
-        <span className="mc-jump-icon">↑</span>
-        <span>JUMP</span>
-      </button>
-
-      {steerMode === "tilt" ? (
-        <div className="mc-gyro-layout">
-          <div className="mc-gyro-side">
-            <HoldButton
-              className="mc-aux-btn mc-drift-btn"
-              activeClassName="is-pressed"
-              onChange={(v) => updateField("handbrake", v)}
-            >
-              <span className="mc-btn-icon">
-                <Icons.Drift />
-              </span>
-              <span className="mc-aux-label">DRIFT</span>
-            </HoldButton>
-
-            <HoldButton
-              className="mc-pedal mc-brake-pedal"
-              activeClassName="is-pressed"
-              onChange={(v) => updateField("brake", v)}
-            >
-              <div className="mc-pedal-treads">
-                <span />
-                <span />
-                <span />
-              </div>
-              <div className="mc-pedal-icon">
-                <Icons.BrakeDisc />
-              </div>
-              <div className="mc-pedal-title">BRAKE</div>
-              <div className="mc-pedal-sub">REVERSE</div>
-            </HoldButton>
-          </div>
-
-          <div className="mc-gyro-center-card">
-            <div className="mc-gyro-badge">
-              <Icons.Gyro />
-              <span>TILT PHONE TO STEER</span>
-            </div>
-
-            {!gyroActive ? (
-              <button
-                type="button"
-                className="mc-enable-gyro-action-btn"
-                onClick={openGyroPrompt}
-              >
-                ENABLE GYRO SENSORS
-              </button>
-            ) : (
-              <div className="mc-gyro-horizon">
-                <div
-                  className="mc-gyro-horizon-bar"
-                  style={{
-                    transform: `rotate(${Math.round(-steerVal * 35)}deg)`,
-                  }}
-                >
-                  <span className="mc-horizon-tip" />
-                  <span className="mc-horizon-center" />
-                  <span className="mc-horizon-tip" />
-                </div>
-                <div className="mc-gyro-angle-val">
-                  {steerVal > 0.04
-                    ? `LEFT ${Math.round(steerVal * 100)}%`
-                    : steerVal < -0.04
-                      ? `RIGHT ${Math.round(Math.abs(steerVal) * 100)}%`
-                      : "0° CENTER"}
-                </div>
-              </div>
-            )}
-
-            {gyroPermNeeded && (
-              <div className="mc-gyro-perm-warning">
-                PERMISSION DENIED. CHECK BROWSER HTTPS/PERMISSIONS.
-              </div>
-            )}
-
-            <button
-              type="button"
-              className="mc-recenter-pill"
-              onClick={calibrateTilt}
-            >
-              ZERO TILT (CENTER)
-            </button>
-          </div>
-
-          <div className="mc-gyro-side">
-            <HoldButton
-              className="mc-aux-btn mc-boost-btn"
-              activeClassName="is-pressed"
-              onChange={(v) => updateField("boost", v)}
-            >
-              <span className="mc-btn-icon">
-                <Icons.Boost />
-              </span>
-              <span className="mc-aux-label">M-BOOST</span>
-            </HoldButton>
-
-            <HoldButton
-              className="mc-pedal mc-gas-pedal"
-              activeClassName="is-pressed"
-              onChange={(v) => updateField("accelerate", v)}
-            >
-              <div className="mc-pedal-treads">
-                <span />
-                <span />
-                <span />
-              </div>
-              <div className="mc-pedal-icon">
-                <Icons.GasPedal />
-              </div>
-              <div className="mc-pedal-title">ACCEL</div>
-              <div className="mc-pedal-sub">THROTTLE</div>
-            </HoldButton>
-          </div>
-        </div>
-      ) : (
-        <div
-          className={
-            steerSide === "right"
-              ? "mc-wheel-layout wheel-on-right"
-              : "mc-wheel-layout wheel-on-left"
-          }
-        >
+      {isOnFoot ? (
+        <div className="mc-character-layout">
+          {/* Left Zone: Analog Joystick for Small / In-Place Movements */}
           <div
-            ref={wheelBoxRef}
-            className="mc-rotary-wheel-zone"
-            onTouchStart={handleWheelStart}
-            onTouchMove={handleWheelMove}
-            onTouchEnd={handleWheelEnd}
-            onTouchCancel={handleWheelEnd}
-            onMouseDown={handleWheelStart}
+            ref={joyBoxRef}
+            className="mc-joy-zone"
+            onTouchStart={handleMoveJoyUpdate}
+            onTouchMove={handleMoveJoyUpdate}
+            onTouchEnd={handleMoveJoyEnd}
+            onTouchCancel={handleMoveJoyEnd}
+            onMouseDown={handleMoveJoyUpdate}
             onMouseMove={(e) => {
-              if (e.buttons === 1) handleWheelMove(e);
+              if (e.buttons === 1) handleMoveJoyUpdate(e);
             }}
-            onMouseUp={handleWheelEnd}
-            onMouseLeave={handleWheelEnd}
+            onMouseUp={handleMoveJoyEnd}
+            onMouseLeave={handleMoveJoyEnd}
           >
-            <div className="mc-rotary-ring-guide">
-              <div className="mc-rotary-glow" />
-              <SteeringWheelGraphic
-                steerValue={steerVal}
-                activeGrab={wheelGrabbed}
+            <div className="mc-joy-ring">
+              <div
+                className={
+                  joyKnob.active ? "mc-joy-knob active" : "mc-joy-knob"
+                }
+                style={{
+                  transform: `translate(${joyKnob.x}px, ${joyKnob.y}px)`,
+                }}
               />
             </div>
-
             <div className="mc-rotary-footer">
-              <span className="mc-rotary-hint">CIRCULAR ROTATION</span>
+              <span className="mc-rotary-hint">FINE MOVE JOYSTICK</span>
               <span className="mc-rotary-deg">
-                {Math.round(-steerVal * MAX_WHEEL_ROTATION_DEG)}°
+                {Math.round(
+                  Math.hypot(inputRef.current.moveX, inputRef.current.moveY) *
+                    100,
+                )}
+                %
               </span>
             </div>
           </div>
 
-          <div className="mc-dual-pedals-zone">
-            <div className="mc-aux-row">
-              <HoldButton
-                className="mc-aux-btn mc-drift-btn"
-                activeClassName="is-pressed"
-                onChange={(v) => updateField("handbrake", v)}
-              >
-                <span className="mc-btn-icon">
-                  <Icons.Drift />
+          {/* Center Zone: Continuous Auto-Run Button + Sprint, Jump, Crouch, Enter Car, Emotes */}
+          <div className="mc-char-center-actions">
+            <button
+              type="button"
+              className={
+                autoRun ? "mc-autorun-btn is-running" : "mc-autorun-btn"
+              }
+              onClick={toggleAutoRun}
+            >
+              <span className="mc-autorun-dot" />
+              <div className="mc-autorun-text">
+                <span className="mc-autorun-title">
+                  {autoRun
+                    ? "RUNNING STRAIGHT (TAP TO STOP)"
+                    : "RUN CONTINUOUSLY"}
                 </span>
-                <span className="mc-aux-label">DRIFT</span>
-              </HoldButton>
+                <span className="mc-autorun-sub">
+                  SWIPE RIGHT PAD HORIZONTALLY TO STEER DIRECTION
+                </span>
+              </div>
+            </button>
 
+            <div className="mc-char-primary-grid">
               <HoldButton
                 className="mc-aux-btn mc-boost-btn"
                 activeClassName="is-pressed"
-                onChange={(v) => updateField("boost", v)}
+                onChange={(v) => updateField("sprint", v)}
               >
-                <span className="mc-btn-icon">
-                  <Icons.Boost />
-                </span>
-                <span className="mc-aux-label">M-BOOST</span>
+                <span className="mc-aux-label">SPRINT</span>
               </HoldButton>
+
+              <HoldButton
+                className="mc-aux-btn mc-drift-btn"
+                activeClassName="is-pressed"
+                onChange={(v) => updateField("jump", v)}
+              >
+                <span className="mc-aux-label">JUMP ↑</span>
+              </HoldButton>
+
+              <HoldButton
+                className="mc-aux-btn mc-crouch-btn"
+                activeClassName="is-pressed"
+                onChange={(v) => updateField("crouch", v)}
+              >
+                <span className="mc-aux-label">CROUCH</span>
+              </HoldButton>
+
+              <button
+                type="button"
+                className={`mc-aux-btn mc-enter-car-btn ${telemetry.nearCar ? "ready" : ""}`}
+                onClick={() =>
+                  socketRef.current?.emit("controller:action", "toggleVehicle")
+                }
+              >
+                <span className="mc-aux-label">ENTER BMW</span>
+              </button>
             </div>
 
-            <div className="mc-pedals-pair">
-              <HoldButton
-                className="mc-pedal mc-brake-pedal"
-                activeClassName="is-pressed"
-                onChange={(v) => updateField("brake", v)}
-              >
-                <div className="mc-pedal-treads">
-                  <span />
-                  <span />
-                  <span />
-                </div>
-                <div className="mc-pedal-icon">
-                  <Icons.BrakeDisc />
-                </div>
-                <div className="mc-pedal-title">BRAKE</div>
-                <div className="mc-pedal-sub">REVERSE</div>
-              </HoldButton>
+            <div className="mc-char-emote-row">
+              {CONTROLLER_EMOTES.map((emote) => (
+                <button
+                  key={emote.id}
+                  type="button"
+                  className="mc-mini-emote-btn"
+                  onClick={() =>
+                    socketRef.current?.emit(
+                      "controller:action",
+                      `emote:${emote.id}`,
+                    )
+                  }
+                >
+                  {emote.label}
+                </button>
+              ))}
+            </div>
+          </div>
 
-              <HoldButton
-                className="mc-pedal mc-gas-pedal"
-                activeClassName="is-pressed"
-                onChange={(v) => updateField("accelerate", v)}
-              >
-                <div className="mc-pedal-treads">
-                  <span />
-                  <span />
-                  <span />
-                </div>
-                <div className="mc-pedal-icon">
-                  <Icons.GasPedal />
-                </div>
-                <div className="mc-pedal-title">ACCEL</div>
-                <div className="mc-pedal-sub">THROTTLE</div>
-              </HoldButton>
+          {/* Right Zone: Horizontal Swipe Trackpad for Turning Direction */}
+          <div
+            ref={swipeBoxRef}
+            className="mc-swipe-turn-zone"
+            onTouchStart={handleSwipeStart}
+            onTouchMove={handleSwipeMove}
+            onTouchEnd={handleSwipeEnd}
+            onTouchCancel={handleSwipeEnd}
+            onMouseDown={handleSwipeStart}
+            onMouseMove={(e) => {
+              if (e.buttons === 1) handleSwipeMove(e);
+            }}
+            onMouseUp={handleSwipeEnd}
+            onMouseLeave={handleSwipeEnd}
+          >
+            <div className="mc-swipe-header">SWIPE HORIZONTALLY TO TURN</div>
+
+            <div className="mc-swipe-track">
+              <span className="mc-swipe-arrow">‹‹ LEFT</span>
+              <div
+                className={
+                  swipeIndicator.active
+                    ? "mc-swipe-puck active"
+                    : "mc-swipe-puck"
+                }
+                style={{
+                  transform: `translateX(${swipeIndicator.offset}px)`,
+                }}
+              />
+              <span className="mc-swipe-arrow">RIGHT ››</span>
+            </div>
+
+            <div className="mc-rotary-footer">
+              <span className="mc-rotary-hint">DIRECTION TRACKPAD</span>
+              <span className="mc-rotary-deg">360° TURN</span>
             </div>
           </div>
         </div>
+      ) : (
+        <>
+          <button
+            type="button"
+            className="mc-jump-btn mc-jump-floating"
+            onPointerDown={(event) => {
+              event.preventDefault();
+              updateField("jump", true);
+            }}
+            onPointerUp={() => updateField("jump", false)}
+            onPointerCancel={() => updateField("jump", false)}
+            onPointerLeave={() => updateField("jump", false)}
+          >
+            <span className="mc-jump-icon">↑</span>
+            <span>JUMP</span>
+          </button>
+
+          {steerMode === "tilt" ? (
+            <div className="mc-gyro-layout">
+              <div className="mc-gyro-side">
+                <HoldButton
+                  className="mc-aux-btn mc-drift-btn"
+                  activeClassName="is-pressed"
+                  onChange={(v) => updateField("handbrake", v)}
+                >
+                  <span className="mc-btn-icon">
+                    <Icons.Drift />
+                  </span>
+                  <span className="mc-aux-label">DRIFT</span>
+                </HoldButton>
+
+                <HoldButton
+                  className="mc-pedal mc-brake-pedal"
+                  activeClassName="is-pressed"
+                  onChange={(v) => updateField("brake", v)}
+                >
+                  <div className="mc-pedal-treads">
+                    <span />
+                    <span />
+                    <span />
+                  </div>
+                  <div className="mc-pedal-icon">
+                    <Icons.BrakeDisc />
+                  </div>
+                  <div className="mc-pedal-title">BRAKE</div>
+                  <div className="mc-pedal-sub">REVERSE</div>
+                </HoldButton>
+              </div>
+
+              <div className="mc-gyro-center-card">
+                <div className="mc-gyro-badge">
+                  <Icons.Gyro />
+                  <span>TILT PHONE TO STEER</span>
+                </div>
+
+                {!gyroActive ? (
+                  <button
+                    type="button"
+                    className="mc-enable-gyro-action-btn"
+                    onClick={openGyroPrompt}
+                  >
+                    ENABLE GYRO SENSORS
+                  </button>
+                ) : (
+                  <div className="mc-gyro-horizon">
+                    <div
+                      className="mc-gyro-horizon-bar"
+                      style={{
+                        transform: `rotate(${Math.round(-steerVal * 35)}deg)`,
+                      }}
+                    >
+                      <span className="mc-horizon-tip" />
+                      <span className="mc-horizon-center" />
+                      <span className="mc-horizon-tip" />
+                    </div>
+                    <div className="mc-gyro-angle-val">
+                      {steerVal > 0.04
+                        ? `LEFT ${Math.round(steerVal * 100)}%`
+                        : steerVal < -0.04
+                          ? `RIGHT ${Math.round(Math.abs(steerVal) * 100)}%`
+                          : "0° CENTER"}
+                    </div>
+                  </div>
+                )}
+
+                {gyroPermNeeded && (
+                  <div className="mc-gyro-perm-warning">
+                    PERMISSION DENIED. CHECK BROWSER HTTPS/PERMISSIONS.
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  className="mc-recenter-pill"
+                  onClick={calibrateTilt}
+                >
+                  ZERO TILT (CENTER)
+                </button>
+              </div>
+
+              <div className="mc-gyro-side">
+                <HoldButton
+                  className="mc-aux-btn mc-boost-btn"
+                  activeClassName="is-pressed"
+                  onChange={(v) => updateField("boost", v)}
+                >
+                  <span className="mc-btn-icon">
+                    <Icons.Boost />
+                  </span>
+                  <span className="mc-aux-label">M-BOOST</span>
+                </HoldButton>
+
+                <HoldButton
+                  className="mc-pedal mc-gas-pedal"
+                  activeClassName="is-pressed"
+                  onChange={(v) => updateField("accelerate", v)}
+                >
+                  <div className="mc-pedal-treads">
+                    <span />
+                    <span />
+                    <span />
+                  </div>
+                  <div className="mc-pedal-icon">
+                    <Icons.GasPedal />
+                  </div>
+                  <div className="mc-pedal-title">ACCEL</div>
+                  <div className="mc-pedal-sub">THROTTLE</div>
+                </HoldButton>
+              </div>
+            </div>
+          ) : (
+            <div
+              className={
+                steerSide === "right"
+                  ? "mc-wheel-layout wheel-on-right"
+                  : "mc-wheel-layout wheel-on-left"
+              }
+            >
+              <div
+                ref={wheelBoxRef}
+                className="mc-rotary-wheel-zone"
+                onTouchStart={handleWheelStart}
+                onTouchMove={handleWheelMove}
+                onTouchEnd={handleWheelEnd}
+                onTouchCancel={handleWheelEnd}
+                onMouseDown={handleWheelStart}
+                onMouseMove={(e) => {
+                  if (e.buttons === 1) handleWheelMove(e);
+                }}
+                onMouseUp={handleWheelEnd}
+                onMouseLeave={handleWheelEnd}
+              >
+                <div className="mc-rotary-ring-guide">
+                  <div className="mc-rotary-glow" />
+                  <SteeringWheelGraphic
+                    steerValue={steerVal}
+                    activeGrab={wheelGrabbed}
+                  />
+                </div>
+
+                <div className="mc-rotary-footer">
+                  <span className="mc-rotary-hint">CIRCULAR ROTATION</span>
+                  <span className="mc-rotary-deg">
+                    {Math.round(-steerVal * MAX_WHEEL_ROTATION_DEG)}°
+                  </span>
+                </div>
+              </div>
+
+              <div className="mc-dual-pedals-zone">
+                <div className="mc-aux-row">
+                  <HoldButton
+                    className="mc-aux-btn mc-drift-btn"
+                    activeClassName="is-pressed"
+                    onChange={(v) => updateField("handbrake", v)}
+                  >
+                    <span className="mc-btn-icon">
+                      <Icons.Drift />
+                    </span>
+                    <span className="mc-aux-label">DRIFT</span>
+                  </HoldButton>
+
+                  <HoldButton
+                    className="mc-aux-btn mc-boost-btn"
+                    activeClassName="is-pressed"
+                    onChange={(v) => updateField("boost", v)}
+                  >
+                    <span className="mc-btn-icon">
+                      <Icons.Boost />
+                    </span>
+                    <span className="mc-aux-label">M-BOOST</span>
+                  </HoldButton>
+                </div>
+
+                <div className="mc-pedals-pair">
+                  <HoldButton
+                    className="mc-pedal mc-brake-pedal"
+                    activeClassName="is-pressed"
+                    onChange={(v) => updateField("brake", v)}
+                  >
+                    <div className="mc-pedal-treads">
+                      <span />
+                      <span />
+                      <span />
+                    </div>
+                    <div className="mc-pedal-icon">
+                      <Icons.BrakeDisc />
+                    </div>
+                    <div className="mc-pedal-title">BRAKE</div>
+                    <div className="mc-pedal-sub">REVERSE</div>
+                  </HoldButton>
+
+                  <HoldButton
+                    className="mc-pedal mc-gas-pedal"
+                    activeClassName="is-pressed"
+                    onChange={(v) => updateField("accelerate", v)}
+                  >
+                    <div className="mc-pedal-treads">
+                      <span />
+                      <span />
+                      <span />
+                    </div>
+                    <div className="mc-pedal-icon">
+                      <Icons.GasPedal />
+                    </div>
+                    <div className="mc-pedal-title">ACCEL</div>
+                    <div className="mc-pedal-sub">THROTTLE</div>
+                  </HoldButton>
+                </div>
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       {settingsOpen && (
