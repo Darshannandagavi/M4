@@ -27,6 +27,8 @@ You are helping with an existing software project.
 │   ├── Character
 │   │   ├── CharacterController.js
 │   │   └── CharacterModel.jsx
+│   ├── Combat
+│   │   └── CombatManager.jsx
 │   ├── Controller
 │   │   └── PhoneControllerApp.jsx
 │   ├── Game
@@ -309,7 +311,7 @@ const wheelRigCache = new WeakMap();
 const doorRigCache = new WeakMap();
 
 const BMWM4 = forwardRef(function BMWM4(
-  { onWheelsReady, onError, doorOpen = false },
+  { onWheelsReady, onError, doorProgressRef },
   forwardedRef,
 ) {
   const { scene } = useGLTF(modelUrl);
@@ -400,11 +402,25 @@ const BMWM4 = forwardRef(function BMWM4(
 
   useFrame((_, rawDelta) => {
     const dt = Math.min(rawDelta, 0.05);
-    const targetAngle = doorOpen ? 1.08 : 0;
+    const timeline = doorProgressRef?.current;
+    let targetAngle = 0;
+
+    if (timeline?.animation === "enterCar") {
+      const p = timeline.progress;
+      const opening = THREE.MathUtils.smoothstep(p, 0.18, 0.38);
+      const closing = 1 - THREE.MathUtils.smoothstep(p, 0.72, 0.85);
+      targetAngle = 1.08 * opening * closing;
+    } else if (timeline?.animation === "exitCar") {
+      const p = timeline.progress;
+      const opening = THREE.MathUtils.smoothstep(p, 0.1, 0.3);
+      const closing = 1 - THREE.MathUtils.smoothstep(p, 0.76, 0.95);
+      targetAngle = 1.08 * opening * closing;
+    }
+
     doorAngleRef.current = THREE.MathUtils.damp(
       doorAngleRef.current,
       targetAngle,
-      9,
+      18,
       dt,
     );
 
@@ -1531,6 +1547,7 @@ export default function CharacterController({
   collidersRef,
   enabled,
   emoteActive = false,
+  combatStanceActive = false,
   cameraYawRef,
   remoteInputRef,
   onAnimationChange,
@@ -1611,6 +1628,7 @@ export default function CharacterController({
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", clearKeys);
     };
+    
   }, [onEmote]);
 
   useEffect(() => {
@@ -1747,7 +1765,21 @@ export default function CharacterController({
     /* Character facing                                           */
     /* ---------------------------------------------------------- */
 
-    if (hasInput) {
+    /* ---------------------------------------------------------- */
+    /* Character facing                                           */
+    /* ---------------------------------------------------------- */
+
+    if (combatStanceActive) {
+      // Face directly along the camera sightline during ADS or firing
+      const targetYaw = camYaw + Math.PI;
+      let angleDifference = targetYaw - character.rotation.y;
+      angleDifference = Math.atan2(
+        Math.sin(angleDifference),
+        Math.cos(angleDifference),
+      );
+      const turnAlpha = 1 - Math.exp(-TURN_RATE * 1.8 * dt);
+      character.rotation.y += angleDifference * turnAlpha;
+    } else if (hasInput) {
       const targetYaw = Math.atan2(_wishDirection.x, _wishDirection.z);
 
       let angleDifference = targetYaw - character.rotation.y;
@@ -1888,7 +1920,7 @@ FILE: components/Character/CharacterModel.jsx
 ===============================================================================
 
 ```jsx
-import React, { forwardRef, useEffect, useMemo } from "react";
+import React, { forwardRef, useEffect, useMemo, useRef } from "react";
 import { useFrame, useLoader } from "@react-three/fiber";
 import { useAnimations, useFBX } from "@react-three/drei";
 import * as THREE from "three";
@@ -1898,10 +1930,6 @@ import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.j
 import characterUrl from "../../assets/models/Characters/X Bot.fbx";
 
 export const CHARACTER_SCALE = 0.01;
-
-/* ------------------------------------------------------------------ */
-/* Discover animation files                                           */
-/* ------------------------------------------------------------------ */
 
 const animationContext = require.context(
   "../../assets/models/Characters",
@@ -1928,8 +1956,9 @@ const ANIMATION_ALIASES = {
   crouchIdle: ["crouchingidle", "crouchidle"],
   crouchWalk: ["crouchwalk", "crouchingwalk"],
   jump: ["jumping", "jump"],
+  knockedOut: ["knockedout", "dying", "death"],
   wave: ["wave", "waving", "idle"],
-  dance: ["MacarenaDance", "hiphopdancing", "breakdance", "crouchwalk"],
+  dance: ["macarenadance", "hiphopdancing", "breakdance", "crouchwalk"],
   salute: ["salute", "jumping"],
   celebrate: ["celebrate", "celebration", "victory", "jumping"],
   point: ["point", "pointing", "crouchingidle"],
@@ -1948,15 +1977,11 @@ const ONE_SHOT = new Set([
   "sit",
   "enterCar",
   "exitCar",
+  "knockedOut",
 ]);
 
 const MISSING_CLIP_FALLBACK_MS = 650;
 
-/**
- * Mixamo FBX animations bake horizontal root motion into the Hips position track,
- * which makes the character mesh drift away from its collider and snap back.
- * Lock X and Z on the Hips position track to keep animations in-place.
- */
 function stripRootMotion(clip) {
   clip.tracks.forEach((track) => {
     if (/hips\.position$/i.test(track.name)) {
@@ -1972,8 +1997,91 @@ function stripRootMotion(clip) {
   return clip;
 }
 
+function buildGunMesh() {
+  const group = new THREE.Group();
+  group.name = "EQUIPPED_WEAPON_GROUP";
+  // Scaled in Mixamo centimeter space (since character root has 0.01 scale)
+  group.scale.setScalar(100);
+  group.position.set(0, 8, 4);
+  group.rotation.set(Math.PI / 2, 0, 0);
+
+  const darkMetal = new THREE.MeshStandardMaterial({
+    color: "#1b2432",
+    metalness: 0.85,
+    roughness: 0.25,
+  });
+  const accentMat = new THREE.MeshStandardMaterial({
+    color: "#2d79ff",
+    metalness: 0.7,
+    roughness: 0.3,
+    emissive: "#0b2968",
+    emissiveIntensity: 0.4,
+  });
+  const muzzleMat = new THREE.MeshBasicMaterial({
+    color: "#ffaa2b",
+    transparent: true,
+    opacity: 0,
+  });
+
+  // Receiver body
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(0.055, 0.09, 0.46),
+    darkMetal,
+  );
+  body.position.set(0, 0.02, 0.14);
+  group.add(body);
+
+  // Barrel
+  const barrel = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.014, 0.014, 0.36, 8),
+    darkMetal,
+  );
+  barrel.rotation.x = Math.PI / 2;
+  barrel.position.set(0, 0.035, 0.44);
+  group.add(barrel);
+
+  // Magazine
+  const mag = new THREE.Mesh(
+    new THREE.BoxGeometry(0.04, 0.16, 0.065),
+    accentMat,
+  );
+  mag.position.set(0, -0.08, 0.18);
+  mag.rotation.x = 0.22;
+  group.add(mag);
+
+  // Optic sight
+  const scope = new THREE.Mesh(
+    new THREE.BoxGeometry(0.042, 0.045, 0.12),
+    accentMat,
+  );
+  scope.position.set(0, 0.082, 0.12);
+  group.add(scope);
+
+  // Muzzle flash
+  const flash = new THREE.Mesh(
+    new THREE.SphereGeometry(0.065, 6, 6),
+    muzzleMat,
+  );
+  flash.position.set(0, 0.035, 0.64);
+  flash.name = "MUZZLE_FLASH";
+  group.add(flash);
+
+  group.userData = { accentMat, muzzleMat, barrel };
+  return group;
+}
+
 const CharacterModel = forwardRef(function CharacterModel(
-  { animation = "idle", visible = true, steerValue = 0, onAnimationFinished },
+  {
+    animation = "idle",
+    visible = true,
+    weaponId = "fist",
+    aiming = false,
+    firing = false,
+    aimPitch = 0,
+    bodyColor = null,
+    onAnimationFinished,
+    onAnimationProgress,
+  },
   forwardedRef,
 ) {
   const sourceCharacter = useFBX(characterUrl);
@@ -1984,6 +2092,8 @@ const CharacterModel = forwardRef(function CharacterModel(
   );
 
   const bonesRef = useMemo(() => ({}), []);
+  const gunGroupRef = useRef(null);
+  const activeAnimationRef = useRef(null);
 
   const animationModels = useLoader(FBXLoader, animationUrls);
 
@@ -2011,9 +2121,12 @@ const CharacterModel = forwardRef(function CharacterModel(
   const { actions, mixer } = useAnimations(clips, forwardedRef);
 
   useEffect(() => {
+    Object.keys(bonesRef).forEach((k) => delete bonesRef[k]);
+
     character.traverse((node) => {
       if (node.isBone) {
-        bonesRef[node.name] = node;
+        const cleanKey = node.name.replace(/^mixamorig:?/i, "");
+        bonesRef[cleanKey] = node;
       }
       if (!node.isMesh) return;
 
@@ -2029,95 +2142,154 @@ const CharacterModel = forwardRef(function CharacterModel(
         materials.forEach((material) => {
           if (!material) return;
           material.side = THREE.FrontSide;
+          if (bodyColor && material.color) {
+            material.color.set(bodyColor);
+          }
           material.needsUpdate = true;
         });
       }
     });
-  }, [character, bonesRef]);
+
+    const rightHand = bonesRef.RightHand;
+    if (rightHand && !gunGroupRef.current) {
+      const gun = buildGunMesh();
+      rightHand.add(gun);
+      gunGroupRef.current = gun;
+    }
+  }, [character, bonesRef, bodyColor]);
 
   useEffect(() => {
-    // Rotate the inner FBX model by +90 deg so local +X is forward (matching CarController),
-    // or keep standard Mixamo +Z and let CharacterController align rotation.
     character.rotation.set(0, 0, 0);
   }, [character]);
 
-  
-useEffect(() => {
-  const aliases = ANIMATION_ALIASES[animation] || [normalize(animation)];
+  useEffect(() => {
+    const aliases = ANIMATION_ALIASES[animation] || [normalize(animation)];
 
-  let action = null;
+    let action = null;
 
-  for (const alias of aliases) {
-    if (actions[alias]) {
-      action = actions[alias];
-      break;
+    for (const alias of aliases) {
+      if (actions[alias]) {
+        action = actions[alias];
+        break;
+      }
     }
-  }
 
-  Object.values(actions).forEach((candidate) => {
-    if (candidate && candidate !== action) {
-      candidate.fadeOut(0.15);
+    Object.values(actions).forEach((candidate) => {
+      if (candidate && candidate !== action) {
+        candidate.fadeOut(0.15);
+      }
+    });
+
+    if (!action) {
+      if (ONE_SHOT.has(animation)) {
+        const timer = window.setTimeout(() => {
+          onAnimationFinished?.(animation);
+        }, MISSING_CLIP_FALLBACK_MS);
+
+        return () => window.clearTimeout(timer);
+      }
+      return undefined;
     }
-  });
 
-  if (!action) {
-    console.error(
-      `[CharacterModel] Animation not found: ${animation}`,
-      Object.keys(actions),
+    const oneShot = ONE_SHOT.has(animation);
+
+    action.reset();
+    action.enabled = true;
+    action.paused = false;
+    action.clampWhenFinished = oneShot;
+    action.timeScale = 1;
+
+    action.setLoop(
+      oneShot ? THREE.LoopOnce : THREE.LoopRepeat,
+      oneShot ? 1 : Infinity,
     );
 
-    if (ONE_SHOT.has(animation)) {
-      const timer = window.setTimeout(() => {
-        onAnimationFinished?.(animation);
-      }, MISSING_CLIP_FALLBACK_MS);
+    const handleFinished = (event) => {
+      if (event.action !== action) return;
+      onAnimationFinished?.(animation);
+    };
 
-      return () => window.clearTimeout(timer);
-    }
-
-    return undefined;
-  }
-
-  const oneShot = ONE_SHOT.has(animation);
-
-  action.reset();
-  action.enabled = true;
-  action.paused = false;
-  action.clampWhenFinished = oneShot;
-  action.timeScale = 1;
-
-  action.setLoop(
-    oneShot ? THREE.LoopOnce : THREE.LoopRepeat,
-    oneShot ? 1 : Infinity,
-  );
-
-  console.log("[Character Animation]", {
-    requested: animation,
-    selected: action.getClip().name,
-    duration: action.getClip().duration,
-    oneShot,
-  });
-
-  const handleFinished = (event) => {
-    if (event.action !== action) return;
-    onAnimationFinished?.(animation);
-  };
-
-  if (oneShot) {
-    mixer.addEventListener("finished", handleFinished);
-  }
-
-  action.fadeIn(0.2).play();
-
-  return () => {
     if (oneShot) {
-      mixer.removeEventListener("finished", handleFinished);
+      mixer.addEventListener("finished", handleFinished);
     }
 
-    action.fadeOut(0.15);
-  };
-}, [animation, actions, mixer, onAnimationFinished]);
+    activeAnimationRef.current = { animation, action };
+    onAnimationProgress?.(animation, 0);
+    action.fadeIn(0.2).play();
 
-  // Apply seated driving posture when inside the car
+    return () => {
+      if (activeAnimationRef.current?.action === action) {
+        activeAnimationRef.current = null;
+      }
+      if (oneShot) {
+        mixer.removeEventListener("finished", handleFinished);
+      }
+      action.fadeOut(0.15);
+    };
+  }, [animation, actions, mixer, onAnimationFinished, onAnimationProgress]);
+
+  useFrame((state) => {
+    const active = activeAnimationRef.current;
+    if (active) {
+      const duration = active.action.getClip().duration;
+      if (duration && duration > 0) {
+        const progress = THREE.MathUtils.clamp(
+          active.action.time / duration,
+          0,
+          1,
+        );
+        onAnimationProgress?.(active.animation, progress);
+      }
+    }
+
+    // Update equipped weapon appearance and procedural upper-body aiming pose
+    const gun = gunGroupRef.current;
+    const isArmed =
+      weaponId &&
+      weaponId !== "fist" &&
+      animation !== "drivingSeat" &&
+      animation !== "enterCar" &&
+      animation !== "exitCar" &&
+      animation !== "knockedOut";
+
+    if (gun) {
+      gun.visible = Boolean(isArmed);
+      if (gun.userData?.accentMat) {
+        gun.userData.accentMat.color.set(
+          weaponId === "mp40" ? "#ff9f0a" : "#2d79ff",
+        );
+      }
+      if (gun.userData?.barrel) {
+        gun.userData.barrel.scale.set(1, weaponId === "mp40" ? 0.65 : 1, 1);
+      }
+      if (gun.userData?.muzzleMat) {
+        gun.userData.muzzleMat.opacity = firing
+          ? 0.55 + Math.sin(state.clock.elapsedTime * 65) * 0.45
+          : 0;
+      }
+    }
+
+    if (isArmed && (aiming || firing)) {
+      const spine = bonesRef.Spine1 || bonesRef.Spine;
+      const rightArm = bonesRef.RightArm;
+      const rightForeArm = bonesRef.RightForeArm;
+
+      if (spine) {
+        spine.rotation.x += THREE.MathUtils.clamp(
+          -aimPitch * 0.55,
+          -0.45,
+          0.45,
+        );
+      }
+      if (rightArm) {
+        rightArm.rotation.x = -1.15 - aimPitch * 0.65;
+        rightArm.rotation.z = -0.15;
+      }
+      if (rightForeArm) {
+        rightForeArm.rotation.x = -0.25;
+      }
+    }
+  });
 
   useEffect(() => {
     return () => {
@@ -2133,6 +2305,407 @@ useEffect(() => {
 });
 
 export default CharacterModel;
+```
+
+===============================================================================
+FILE: components/Combat/CombatManager.jsx
+===============================================================================
+
+```jsx
+import React, { useEffect, useRef, useState } from "react";
+import { useFrame, useThree } from "@react-three/fiber";
+import { Html } from "@react-three/drei";
+import * as THREE from "three";
+import CharacterModel from "../Character/CharacterModel";
+import { WEAPONS } from "../../config/gameConstants";
+
+const BOT_COUNT = 6;
+const BOT_RADIUS = 18;
+const BOT_SPEED = 2.4;
+const BOT_ATTACK_RANGE = 16;
+const BOT_DAMAGE_PER_SEC = 6;
+
+const _rayOrigin = new THREE.Vector3();
+const _rayDir = new THREE.Vector3();
+const _down = new THREE.Vector3(0, -1, 0);
+const _groundRay = new THREE.Raycaster();
+const _shotRay = new THREE.Raycaster();
+
+function sampleGroundY(meshes, x, z, fallbackY = 0) {
+  if (!meshes || !meshes.length) return fallbackY;
+  _rayOrigin.set(x, fallbackY + 45, z);
+  _groundRay.set(_rayOrigin, _down);
+  _groundRay.far = 120;
+  const hits = _groundRay.intersectObjects(meshes, false);
+  for (const hit of hits) {
+    if (hit.face && Math.abs(hit.face.normal.y) > 0.45) {
+      return hit.point.y;
+    }
+  }
+  return fallbackY;
+}
+
+function createBot(id, centerPos) {
+  const angle = (id / BOT_COUNT) * Math.PI * 2 + Math.random() * 0.5;
+  const dist = BOT_RADIUS + (id % 3) * 9;
+  const x = (centerPos?.x || 0) + Math.cos(angle) * dist;
+  const z = (centerPos?.z || 0) + Math.sin(angle) * dist;
+  const y = centerPos?.y || 0;
+
+  return {
+    id,
+    position: new THREE.Vector3(x, y, z),
+    yaw: angle + Math.PI,
+    hp: 100,
+    maxHp: 100,
+    state: "patrol", // patrol | chase | knockedOut
+    anim: "walk",
+    respawnTimer: 0,
+    strafeDir: id % 2 === 0 ? 1 : -1,
+    strafeTimer: 2 + Math.random() * 2,
+  };
+}
+
+export default function CombatManager({
+  enabled,
+  characterRef,
+  collidersRef,
+  weaponId,
+  firing,
+  onShotEvaluated,
+  onPlayerDamaged,
+}) {
+  const { camera } = useThree();
+  const botsRef = useRef([]);
+  const botGroupRefs = useRef({});
+  const hitboxRefs = useRef({});
+  const fireCooldownRef = useRef(0);
+
+  const [botsHud, setBotsHud] = useState([]);
+  const [tracers, setTracers] = useState([]);
+  const [damagePopups, setDamagePopups] = useState([]);
+
+  // Initialize bots around spawn
+  useEffect(() => {
+    const startPos =
+      characterRef.current?.position || new THREE.Vector3(0, 0, 0);
+    const initialBots = Array.from({ length: BOT_COUNT }, (_, idx) =>
+      createBot(idx, startPos),
+    );
+    botsRef.current = initialBots;
+    setBotsHud(
+      initialBots.map((b) => ({
+        id: b.id,
+        hp: b.hp,
+        maxHp: b.maxHp,
+        anim: b.anim,
+        state: b.state,
+      })),
+    );
+  }, [characterRef]);
+
+  useFrame((_, rawDelta) => {
+    const dt = Math.min(rawDelta, 0.05);
+    fireCooldownRef.current = Math.max(0, fireCooldownRef.current - dt);
+
+    // Clean up expired tracers & floating damage numbers
+    const now = performance.now();
+    setTracers((prev) =>
+      prev.length ? prev.filter((item) => now - item.createdAt < 90) : prev,
+    );
+    setDamagePopups((prev) =>
+      prev.length ? prev.filter((item) => now - item.createdAt < 650) : prev,
+    );
+
+    const playerPos = characterRef.current?.position;
+    const colliders = collidersRef.current || [];
+    const meshes = colliders.slice(0, 40).map((c) => c.mesh);
+
+    let hudDirty = false;
+
+    // Update AI bots
+    botsRef.current.forEach((bot) => {
+      const botObj = botGroupRefs.current[bot.id];
+      if (!botObj) return;
+
+      if (bot.state === "knockedOut") {
+        bot.respawnTimer -= dt;
+        if (bot.respawnTimer <= 0 && playerPos) {
+          const fresh = createBot(bot.id, playerPos);
+          fresh.position.y = sampleGroundY(
+            meshes,
+            fresh.position.x,
+            fresh.position.z,
+            playerPos.y,
+          );
+          Object.assign(bot, fresh);
+          hudDirty = true;
+        }
+        botObj.position.copy(bot.position);
+        botObj.rotation.y = bot.yaw;
+        return;
+      }
+
+      if (playerPos) {
+        const dx = playerPos.x - bot.position.x;
+        const dz = playerPos.z - bot.position.z;
+        const dist = Math.hypot(dx, dz);
+
+        bot.yaw = Math.atan2(dx, dz);
+
+        bot.strafeTimer -= dt;
+        if (bot.strafeTimer <= 0) {
+          bot.strafeDir *= -1;
+          bot.strafeTimer = 1.8 + Math.random() * 2.2;
+        }
+
+        if (dist > 9) {
+          bot.position.x += Math.sin(bot.yaw) * BOT_SPEED * dt;
+          bot.position.z += Math.cos(bot.yaw) * BOT_SPEED * dt;
+          if (bot.anim !== "run") {
+            bot.anim = "run";
+            hudDirty = true;
+          }
+        } else {
+          // Strafe sideways at combat range
+          const perpYaw = bot.yaw + (Math.PI / 2) * bot.strafeDir;
+          bot.position.x += Math.sin(perpYaw) * (BOT_SPEED * 0.65) * dt;
+          bot.position.z += Math.cos(perpYaw) * (BOT_SPEED * 0.65) * dt;
+          if (bot.anim !== "walk") {
+            bot.anim = "walk";
+            hudDirty = true;
+          }
+        }
+
+        const groundY = sampleGroundY(
+          meshes,
+          bot.position.x,
+          bot.position.z,
+          playerPos.y,
+        );
+        bot.position.y = THREE.MathUtils.lerp(bot.position.y, groundY, 0.2);
+
+        if (enabled && dist < BOT_ATTACK_RANGE) {
+          onPlayerDamaged?.(BOT_DAMAGE_PER_SEC * dt);
+        }
+      }
+
+      botObj.position.copy(bot.position);
+      botObj.rotation.y = bot.yaw;
+    });
+
+    if (hudDirty) {
+      setBotsHud(
+        botsRef.current.map((b) => ({
+          id: b.id,
+          hp: b.hp,
+          maxHp: b.maxHp,
+          anim: b.anim,
+          state: b.state,
+        })),
+      );
+    }
+
+    // Handle active weapon firing
+    const weapon = WEAPONS[weaponId];
+    if (
+      !enabled ||
+      !firing ||
+      !weapon ||
+      weapon.id === "fist" ||
+      fireCooldownRef.current > 0
+    ) {
+      return;
+    }
+
+    fireCooldownRef.current = weapon.fireRate;
+
+    // Raycast from center of screen (crosshair) with slight weapon spread
+    camera.getWorldPosition(_rayOrigin);
+    camera.getWorldDirection(_rayDir);
+    _rayDir.x += (Math.random() - 0.5) * weapon.spread;
+    _rayDir.y += (Math.random() - 0.5) * weapon.spread;
+    _rayDir.z += (Math.random() - 0.5) * weapon.spread;
+    _rayDir.normalize();
+
+    _shotRay.set(_rayOrigin, _rayDir);
+    _shotRay.far = weapon.range;
+
+    const activeHitboxes = Object.values(hitboxRefs.current).filter(Boolean);
+    const botHits = _shotRay.intersectObjects(activeHitboxes, false);
+
+    const worldMeshes = colliders.map((c) => c.mesh).filter(Boolean);
+    const worldHits = _shotRay.intersectObjects(worldMeshes, false);
+    const closestWorldDist = worldHits.length
+      ? worldHits[0].distance
+      : Infinity;
+
+    let endPoint = _rayOrigin
+      .clone()
+      .addScaledVector(_rayDir, Math.min(weapon.range, closestWorldDist));
+
+    let hitResult = { hit: false, headshot: false, killed: false, damage: 0 };
+
+    if (botHits.length && botHits[0].distance <= closestWorldDist) {
+      const topHit = botHits[0];
+      endPoint = topHit.point.clone();
+      const { botId, isHead } = topHit.object.userData;
+      const targetBot = botsRef.current.find((b) => b.id === botId);
+
+      if (targetBot && targetBot.state !== "knockedOut") {
+        const dmg = isHead ? weapon.headshotDamage : weapon.damage;
+        targetBot.hp = Math.max(0, targetBot.hp - dmg);
+        const killed = targetBot.hp <= 0;
+
+        if (killed) {
+          targetBot.state = "knockedOut";
+          targetBot.anim = "knockedOut";
+          targetBot.respawnTimer = 4.5;
+        }
+
+        hitResult = {
+          hit: true,
+          headshot: Boolean(isHead),
+          killed,
+          damage: dmg,
+        };
+
+        setDamagePopups((prev) => [
+          ...prev.slice(-8),
+          {
+            id: `${now}-${Math.random()}`,
+            position: endPoint.clone().add(new THREE.Vector3(0, 0.35, 0)),
+            damage: dmg,
+            headshot: Boolean(isHead),
+            createdAt: now,
+          },
+        ]);
+
+        setBotsHud(
+          botsRef.current.map((b) => ({
+            id: b.id,
+            hp: b.hp,
+            maxHp: b.maxHp,
+            anim: b.anim,
+            state: b.state,
+          })),
+        );
+      }
+    }
+
+    const startTrace = characterRef.current
+      ? characterRef.current.position.clone().add(new THREE.Vector3(0, 1.38, 0))
+      : _rayOrigin.clone();
+
+    setTracers((prev) => [
+      ...prev.slice(-6),
+      {
+        id: `${now}-${Math.random()}`,
+        start: startTrace,
+        end: endPoint,
+        color: hitResult.headshot ? "#ff2a5f" : "#ffdd57",
+        createdAt: now,
+      },
+    ]);
+
+    onShotEvaluated?.(hitResult);
+  });
+
+  return (
+    <group>
+      {/* Enemy AI Bots */}
+      {botsHud.map((botState) => (
+        <group
+          key={botState.id}
+          ref={(el) => {
+            botGroupRefs.current[botState.id] = el;
+          }}
+        >
+          <CharacterModel
+            animation={botState.anim}
+            weaponId={botState.state === "knockedOut" ? "fist" : "mp40"}
+            aiming={botState.state !== "knockedOut"}
+            bodyColor="#ff3b5c"
+          />
+
+          {/* Bot Health Bar */}
+          {botState.state !== "knockedOut" && (
+            <Html position={[0, 2.15, 0]} center distanceFactor={14}>
+              <div className="ff-bot-nametag">
+                <div className="ff-bot-hp-track">
+                  <div
+                    className="ff-bot-hp-fill"
+                    style={{
+                      width: `${(botState.hp / botState.maxHp) * 100}%`,
+                    }}
+                  />
+                </div>
+              </div>
+            </Html>
+          )}
+
+          {/* Invisible Raycast Hitboxes (Body + Headshot) */}
+          {botState.state !== "knockedOut" && (
+            <>
+              <mesh
+                position={[0, 0.88, 0]}
+                userData={{ botId: botState.id, isHead: false }}
+                ref={(el) => {
+                  hitboxRefs.current[`body-${botState.id}`] = el;
+                }}
+              >
+                <cylinderGeometry args={[0.38, 0.38, 1.35, 8]} />
+                <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+              </mesh>
+              <mesh
+                position={[0, 1.68, 0]}
+                userData={{ botId: botState.id, isHead: true }}
+                ref={(el) => {
+                  hitboxRefs.current[`head-${botState.id}`] = el;
+                }}
+              >
+                <sphereGeometry args={[0.26, 8, 8]} />
+                <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+              </mesh>
+            </>
+          )}
+        </group>
+      ))}
+
+      {/* Bullet Tracers */}
+      {tracers.map((t) => {
+        const dir = new THREE.Vector3().subVectors(t.end, t.start);
+        const len = dir.length();
+        const mid = new THREE.Vector3()
+          .addVectors(t.start, t.end)
+          .multiplyScalar(0.5);
+        const quat = new THREE.Quaternion().setFromUnitVectors(
+          new THREE.Vector3(0, 1, 0),
+          dir.clone().normalize(),
+        );
+        return (
+          <mesh key={t.id} position={mid} quaternion={quat}>
+            <cylinderGeometry args={[0.018, 0.018, len, 6]} />
+            <meshBasicMaterial color={t.color} />
+          </mesh>
+        );
+      })}
+
+      {/* Floating Free Fire Damage Numbers */}
+      {damagePopups.map((popup) => (
+        <Html key={popup.id} position={popup.position} center>
+          <div
+            className={
+              popup.headshot ? "ff-dmg-popup ff-dmg-headshot" : "ff-dmg-popup"
+            }
+          >
+            {popup.headshot ? `HEADSHOT ${popup.damage}` : popup.damage}
+          </div>
+        </Html>
+      ))}
+    </group>
+  );
+}
 ```
 
 ===============================================================================
@@ -2181,15 +2754,20 @@ export default function PhoneControllerApp() {
     offset: 0,
   });
 
-  const [telemetry, setTelemetry] = useState({
-    speed: 0,
-    gear: "N",
-    rpm: 850,
-    drifting: false,
-    boost: false,
-    playerMode: "driving",
-    nearCar: false,
-  });
+const [telemetry, setTelemetry] = useState({
+  speed: 0,
+  gear: "N",
+  rpm: 850,
+  drifting: false,
+  boost: false,
+  playerMode: "driving",
+  nearCar: false,
+  weaponName: "M4A1 RIFLE",
+  ammo: 30,
+  reserveAmmo: 120,
+  hp: 100,
+  kills: 0,
+});
 
   const [isPortraitViewport, setIsPortraitViewport] = useState(() =>
     typeof window !== "undefined"
@@ -2198,21 +2776,23 @@ export default function PhoneControllerApp() {
   );
 
   const socketRef = useRef(null);
-  const inputRef = useRef({
-    accelerate: false,
-    brake: false,
-    handbrake: false,
-    boost: false,
-    jump: false,
-    crouch: false,
-    sprint: false,
-    autoRun: false,
-    steer: 0,
-    moveX: 0,
-    moveY: 0,
-    lookX: 0,
-    lookY: 0,
-  });
+const inputRef = useRef({
+  accelerate: false,
+  brake: false,
+  handbrake: false,
+  boost: false,
+  jump: false,
+  crouch: false,
+  sprint: false,
+  autoRun: false,
+  fire: false,
+  aim: false,
+  steer: 0,
+  moveX: 0,
+  moveY: 0,
+  lookX: 0,
+  lookY: 0,
+});
   const rawTiltRef = useRef(0);
   const tiltZeroRef = useRef(0);
   const wheelBoxRef = useRef(null);
@@ -2826,6 +3406,84 @@ export default function PhoneControllerApp() {
             </button>
 
             <div className="mc-char-primary-grid">
+              <div className="mc-char-primary-grid">
+                <HoldButton
+                  className="mc-aux-btn mc-fire-btn"
+                  activeClassName="is-pressed"
+                  onChange={(v) => updateField("fire", v)}
+                >
+                  <span className="mc-aux-label">
+                    FIRE ({telemetry.ammo ?? 30})
+                  </span>
+                </HoldButton>
+
+                <HoldButton
+                  className="mc-aux-btn mc-aim-btn"
+                  activeClassName="is-pressed"
+                  onChange={(v) => updateField("aim", v)}
+                >
+                  <span className="mc-aux-label">SCOPE ADS</span>
+                </HoldButton>
+
+                <HoldButton
+                  className="mc-aux-btn mc-boost-btn"
+                  activeClassName="is-pressed"
+                  onChange={(v) => updateField("sprint", v)}
+                >
+                  <span className="mc-aux-label">SPRINT</span>
+                </HoldButton>
+
+                <HoldButton
+                  className="mc-aux-btn mc-drift-btn"
+                  activeClassName="is-pressed"
+                  onChange={(v) => updateField("jump", v)}
+                >
+                  <span className="mc-aux-label">JUMP ↑</span>
+                </HoldButton>
+
+                <button
+                  type="button"
+                  className="mc-aux-btn mc-crouch-btn"
+                  onClick={() =>
+                    socketRef.current?.emit("controller:action", "reloadWeapon")
+                  }
+                >
+                  <span className="mc-aux-label">RELOAD</span>
+                </button>
+
+                <button
+                  type="button"
+                  className="mc-aux-btn mc-crouch-btn"
+                  onClick={() =>
+                    socketRef.current?.emit("controller:action", "switchWeapon")
+                  }
+                >
+                  <span className="mc-aux-label">
+                    {telemetry.weaponName || "SWITCH GUN"}
+                  </span>
+                </button>
+
+                <HoldButton
+                  className="mc-aux-btn mc-crouch-btn"
+                  activeClassName="is-pressed"
+                  onChange={(v) => updateField("crouch", v)}
+                >
+                  <span className="mc-aux-label">CROUCH</span>
+                </HoldButton>
+
+                <button
+                  type="button"
+                  className={`mc-aux-btn mc-enter-car-btn ${telemetry.nearCar ? "ready" : ""}`}
+                  onClick={() =>
+                    socketRef.current?.emit(
+                      "controller:action",
+                      "toggleVehicle",
+                    )
+                  }
+                >
+                  <span className="mc-aux-label">ENTER BMW</span>
+                </button>
+              </div>
               <HoldButton
                 className="mc-aux-btn mc-boost-btn"
                 activeClassName="is-pressed"
@@ -3331,6 +3989,8 @@ import {
   CAMERA_MODES,
   INITIAL_TELEMETRY,
   MAX_WHEEL_ROTATION_DEG,
+  WEAPONS,
+  WEAPON_ORDER,
 } from "../../config/gameConstants";
 import { getNetworkControllerUrl, getSocketUrl } from "../../utils/network";
 import OpenWorldMap from "../World/OpenWorldMap";
@@ -3340,21 +4000,20 @@ import BMWM4 from "../Car/BMWM4";
 import CarController from "../Car/CarController";
 import CharacterModel, { CHARACTER_SCALE } from "../Character/CharacterModel";
 import CharacterController from "../Character/CharacterController";
+import CombatManager from "../Combat/CombatManager";
 import Icons from "../UI/Icons";
 import SteeringWheelGraphic from "../UI/SteeringWheelGraphic";
 import SportSpeedometer from "../UI/SportSpeedometer";
 import { GameSettingsModal, QrConnectModal } from "../UI/GameModals";
 
-// Car faces +X when yaw = 0, so Left (driver side) is -Z
 const DRIVER_DOOR_OFFSET = new THREE.Vector3(0.05, 0, -1.35);
 const DRIVER_SEAT_OFFSET = new THREE.Vector3(-0.08, 0.18, -0.34);
 const INTERACTION_DISTANCE = 3.6;
 const MAX_ENTER_SPEED_KMH = 5.0;
-const TRANSITION_DURATION_MS = 2000;
 
 const EMOTES = [
   { key: "1", id: "wave", label: "Wave" },
-  { key: "2", id: "dance", label: "Dance" },
+  { key: "2", id: "dance", label: "Macarena Dance" },
   { key: "3", id: "salute", label: "Salute" },
   { key: "4", id: "celebrate", label: "Celebrate" },
   { key: "5", id: "point", label: "Point" },
@@ -3370,15 +4029,11 @@ function getCarWorldPoint(car, localOffset, target = new THREE.Vector3()) {
   return target;
 }
 
-/**
- * Keeps the character model seated inside the car while driving,
- * and smoothly interpolates the character through the open door during enter/exit.
- */
 function VehicleOccupantSync({
   carRef,
   characterRef,
   playerMode,
-  transitionStartRef,
+  doorProgressRef,
 }) {
   const doorPos = useRef(new THREE.Vector3());
   const seatPos = useRef(new THREE.Vector3());
@@ -3399,40 +4054,28 @@ function VehicleOccupantSync({
     }
 
     if (playerMode === "entering" || playerMode === "exiting") {
-      const elapsed = performance.now() - transitionStartRef.current;
-      const t = THREE.MathUtils.clamp(elapsed / TRANSITION_DURATION_MS, 0, 1);
-      const smoothT = t * t * (3 - 2 * t);
+      const progress = THREE.MathUtils.clamp(
+        doorProgressRef?.current?.progress ?? 0,
+        0,
+        1,
+      );
 
       getCarWorldPoint(car, DRIVER_DOOR_OFFSET, doorPos.current);
       getCarWorldPoint(car, DRIVER_SEAT_OFFSET, seatPos.current);
 
       if (playerMode === "entering") {
-        character.position.lerpVectors(
-          doorPos.current,
-          seatPos.current,
-          smoothT,
-        );
+        const moveT = THREE.MathUtils.smoothstep(progress, 0.32, 0.96);
+        character.position.lerpVectors(doorPos.current, seatPos.current, moveT);
         character.rotation.set(0, forwardSeatYaw, 0);
         character.scale.setScalar(
-          THREE.MathUtils.lerp(
-            CHARACTER_SCALE,
-            CHARACTER_SCALE * 0.86,
-            smoothT,
-          ),
+          THREE.MathUtils.lerp(CHARACTER_SCALE, CHARACTER_SCALE * 0.86, moveT),
         );
       } else {
-        character.position.lerpVectors(
-          seatPos.current,
-          doorPos.current,
-          smoothT,
-        );
-        character.rotation.set(0, forwardSeatYaw - smoothT * 0.4, 0);
+        const moveT = THREE.MathUtils.smoothstep(progress, 0.28, 0.84);
+        character.position.lerpVectors(seatPos.current, doorPos.current, moveT);
+        character.rotation.set(0, forwardSeatYaw - moveT * 0.4, 0);
         character.scale.setScalar(
-          THREE.MathUtils.lerp(
-            CHARACTER_SCALE * 0.86,
-            CHARACTER_SCALE,
-            smoothT,
-          ),
+          THREE.MathUtils.lerp(CHARACTER_SCALE * 0.86, CHARACTER_SCALE, moveT),
         );
       }
       return;
@@ -3446,12 +4089,13 @@ function VehicleOccupantSync({
 
 export default function LaptopGameApp() {
   const [scenePreset, setScenePreset] = useState("track");
+  const [mapPreset, setMapPreset] = useState("rainier");
   const [cameraMode, setCameraMode] = useState("chase");
   const [steerHudSide, setSteerHudSide] = useState("left");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [qrModalOpen, setQrModalOpen] = useState(false);
   const [phoneLinked, setPhoneLinked] = useState(false);
-  const [playerMode, setPlayerMode] = useState("driving"); // driving | onFoot | entering | exiting
+  const [playerMode, setPlayerMode] = useState("driving");
   const [charAnimation, setCharAnimation] = useState("drivingSeat");
   const [nearCar, setNearCar] = useState(false);
   const [interactionMessage, setInteractionMessage] = useState("");
@@ -3459,15 +4103,34 @@ export default function LaptopGameApp() {
   const [telemetry, setTelemetry] = useState(INITIAL_TELEMETRY);
   const [modelError, setModelError] = useState("");
 
+  // Free Fire Combat State
+  const [weaponId, setWeaponId] = useState("m4a1");
+  const [ammoState, setAmmoState] = useState({
+    m4a1: { mag: WEAPONS.m4a1.magSize, reserve: WEAPONS.m4a1.reserveAmmo },
+    mp40: { mag: WEAPONS.mp40.magSize, reserve: WEAPONS.mp40.reserveAmmo },
+    fist: { mag: 0, reserve: 0 },
+  });
+  const [reloading, setReloading] = useState(false);
+  const [mouseFiring, setMouseFiring] = useState(false);
+  const [mouseAiming, setMouseAiming] = useState(false);
+  const [remoteFiring, setRemoteFiring] = useState(false);
+  const [remoteAiming, setRemoteAiming] = useState(false);
+  const [playerHp, setPlayerHp] = useState(100);
+  const [kills, setKills] = useState(0);
+  const [hitMarker, setHitMarker] = useState(null); // { headshot: boolean }
+
   const collidersRef = useRef([]);
   const carRef = useRef(null);
   const characterRef = useRef(null);
   const wheelAssembliesRef = useRef([]);
   const socketRef = useRef(null);
-  const transitionTimerRef = useRef(null);
-  const transitionStartRef = useRef(0);
+  const doorProgressRef = useRef({
+    animation: null,
+    progress: 0,
+  });
   const interactionPointRef = useRef(new THREE.Vector3());
   const cameraYawRef = useRef(0);
+  const cameraPitchRef = useRef(0.16);
 
   const physicsStateRef = useRef({
     vx: 0,
@@ -3486,6 +4149,8 @@ export default function LaptopGameApp() {
     crouch: false,
     sprint: false,
     autoRun: false,
+    fire: false,
+    aim: false,
     steer: 0,
     moveX: 0,
     moveY: 0,
@@ -3498,8 +4163,17 @@ export default function LaptopGameApp() {
 
   const isCharacterMode = playerMode === "onFoot" || playerMode === "exiting";
   const isTransitioning = playerMode === "entering" || playerMode === "exiting";
-  const doorOpen = playerMode === "entering" || playerMode === "exiting";
   const speedKmh = Math.abs(Number(telemetry.speed) || 0);
+
+  const currentWeapon = WEAPONS[weaponId] || WEAPONS.m4a1;
+  const currentAmmo = ammoState[weaponId] || { mag: 0, reserve: 0 };
+  const isArmed = playerMode === "onFoot" && weaponId !== "fist";
+  const isAiming = isArmed && (mouseAiming || remoteAiming);
+  const isFiring =
+    isArmed &&
+    !reloading &&
+    currentAmmo.mag > 0 &&
+    (mouseFiring || remoteFiring);
 
   const clearRemoteInput = useCallback(() => {
     Object.assign(remoteInputRef.current, {
@@ -3511,6 +4185,8 @@ export default function LaptopGameApp() {
       crouch: false,
       sprint: false,
       autoRun: false,
+      fire: false,
+      aim: false,
       steer: 0,
       moveX: 0,
       moveY: 0,
@@ -3518,6 +4194,80 @@ export default function LaptopGameApp() {
       lookY: 0,
       lookDeltaX: 0,
       lookDeltaY: 0,
+    });
+    setRemoteFiring(false);
+    setRemoteAiming(false);
+    setMouseFiring(false);
+    setMouseAiming(false);
+  }, []);
+
+  const switchWeapon = useCallback(() => {
+    setReloading(false);
+    setWeaponId((prev) => {
+      const idx = WEAPON_ORDER.indexOf(prev);
+      return WEAPON_ORDER[(idx + 1) % WEAPON_ORDER.length];
+    });
+  }, []);
+
+  const reloadWeapon = useCallback(() => {
+    if (reloading || weaponId === "fist") return;
+    const spec = WEAPONS[weaponId];
+    const slot = ammoState[weaponId];
+    if (!spec || !slot || slot.mag >= spec.magSize || slot.reserve <= 0) return;
+
+    setReloading(true);
+    window.setTimeout(() => {
+      setAmmoState((prev) => {
+        const current = prev[weaponId];
+        const needed = spec.magSize - current.mag;
+        const load = Math.min(needed, current.reserve);
+        return {
+          ...prev,
+          [weaponId]: {
+            mag: current.mag + load,
+            reserve: current.reserve - load,
+          },
+        };
+      });
+      setReloading(false);
+    }, spec.reloadTime * 1000);
+  }, [reloading, weaponId, ammoState]);
+
+  const handleShotEvaluated = useCallback(
+    (result) => {
+      setAmmoState((prev) => {
+        const cur = prev[weaponId];
+        if (!cur) return prev;
+        const nextMag = Math.max(0, cur.mag - 1);
+        if (nextMag === 0 && cur.reserve > 0) {
+          window.setTimeout(() => reloadWeapon(), 120);
+        }
+        return {
+          ...prev,
+          [weaponId]: { ...cur, mag: nextMag },
+        };
+      });
+
+      if (result.hit) {
+        setHitMarker({ headshot: result.headshot });
+        window.setTimeout(() => setHitMarker(null), 180);
+        socketRef.current?.emit(
+          "game:haptic",
+          result.headshot ? [40, 25, 65] : 22,
+        );
+      }
+      if (result.killed) {
+        setKills((k) => k + 1);
+      }
+    },
+    [weaponId, reloadWeapon],
+  );
+
+  const handlePlayerDamaged = useCallback((dmg) => {
+    setPlayerHp((prev) => {
+      const next = prev - dmg;
+      if (next <= 0) return 100; // Auto-respawn full HP
+      return next;
     });
   }, []);
 
@@ -3552,7 +4302,6 @@ export default function LaptopGameApp() {
       setInteractionMessage("");
     }
     setEmoteActive(false);
-    transitionTimerRef.current = null;
   }, []);
 
   const enterVehicle = useCallback(() => {
@@ -3577,19 +4326,12 @@ export default function LaptopGameApp() {
     characterRef.current.position.copy(door);
     characterRef.current.rotation.y = carRef.current.rotation.y + Math.PI / 2;
 
-    transitionStartRef.current = performance.now();
+    doorProgressRef.current = { animation: "enterCar", progress: 0 };
     setEmoteActive(false);
     setCharAnimation("enterCar");
     setPlayerMode("entering");
     setInteractionMessage("Opening door & entering BMW M4...");
-
-    if (transitionTimerRef.current)
-      window.clearTimeout(transitionTimerRef.current);
-    transitionTimerRef.current = window.setTimeout(
-      () => finishTransition("entering"),
-      TRANSITION_DURATION_MS,
-    );
-  }, [playerMode, nearCar, speedKmh, clearRemoteInput, finishTransition]);
+  }, [playerMode, nearCar, speedKmh, clearRemoteInput]);
 
   const exitVehicle = useCallback(() => {
     if (playerMode !== "driving" || !carRef.current || !characterRef.current)
@@ -3600,18 +4342,11 @@ export default function LaptopGameApp() {
     }
 
     clearRemoteInput();
-    transitionStartRef.current = performance.now();
+    doorProgressRef.current = { animation: "exitCar", progress: 0 };
     setCharAnimation("exitCar");
     setPlayerMode("exiting");
     setInteractionMessage("Opening door & exiting BMW M4...");
-
-    if (transitionTimerRef.current)
-      window.clearTimeout(transitionTimerRef.current);
-    transitionTimerRef.current = window.setTimeout(
-      () => finishTransition("exiting"),
-      TRANSITION_DURATION_MS,
-    );
-  }, [playerMode, speedKmh, clearRemoteInput, finishTransition]);
+  }, [playerMode, speedKmh, clearRemoteInput]);
 
   const toggleVehicle = useCallback(() => {
     if (playerMode === "onFoot") enterVehicle();
@@ -3632,24 +4367,33 @@ export default function LaptopGameApp() {
     [playerMode, emoteActive],
   );
 
- const handleCharacterAnimationFinished = useCallback(
-   (finishedAnimation) => {
-     if (finishedAnimation === "enterCar") {
-       finishTransition("entering");
-       return;
-     }
+  const handleAnimationProgress = useCallback((animation, progress) => {
+    if (animation !== "enterCar" && animation !== "exitCar") return;
+    doorProgressRef.current = {
+      animation,
+      progress: THREE.MathUtils.clamp(progress, 0, 1),
+    };
+  }, []);
 
-     if (finishedAnimation === "exitCar") {
-       finishTransition("exiting");
-       return;
-     }
+  const handleCharacterAnimationFinished = useCallback(
+    (finishedAnimation) => {
+      if (finishedAnimation === "enterCar") {
+        doorProgressRef.current.progress = 1;
+        finishTransition("entering");
+        return;
+      }
+      if (finishedAnimation === "exitCar") {
+        doorProgressRef.current.progress = 1;
+        finishTransition("exiting");
+        return;
+      }
+      setEmoteActive(false);
+      setCharAnimation("idle");
+    },
+    [finishTransition],
+  );
 
-     setEmoteActive(false);
-     setCharAnimation("idle");
-   },
-   [finishTransition],
- );
-
+  // Keyboard & Mouse Combat Controls (On Foot)
   useEffect(() => {
     const onKeyDown = (event) => {
       if (
@@ -3658,16 +4402,55 @@ export default function LaptopGameApp() {
         event.target?.tagName === "TEXTAREA"
       )
         return;
-      if (event.key.toLowerCase() === "f") {
+      const key = event.key.toLowerCase();
+      if (key === "f") {
         event.preventDefault();
         toggleVehicle();
+      } else if (playerMode === "onFoot") {
+        if (key === "q" || key === "g") {
+          event.preventDefault();
+          switchWeapon();
+        } else if (key === "r") {
+          event.preventDefault();
+          reloadWeapon();
+        }
       }
     };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [toggleVehicle]);
 
-  // Immediately push mode changes to the phone so the Phone HUD switches with zero delay
+    const onMouseDown = (event) => {
+      if (playerMode !== "onFoot") return;
+      if (
+        event.target?.closest(
+          "button, .mc-modal-backdrop, .character-action-panel, .topbar",
+        )
+      ) {
+        return;
+      }
+      if (event.button === 0) setMouseFiring(true);
+      if (event.button === 2) setMouseAiming(true);
+    };
+
+    const onMouseUp = (event) => {
+      if (event.button === 0) setMouseFiring(false);
+      if (event.button === 2) setMouseAiming(false);
+    };
+
+    const onContextMenu = (event) => {
+      if (playerMode === "onFoot") event.preventDefault();
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("mousedown", onMouseDown);
+    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("contextmenu", onContextMenu);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("mousedown", onMouseDown);
+      window.removeEventListener("mouseup", onMouseUp);
+      window.removeEventListener("contextmenu", onContextMenu);
+    };
+  }, [toggleVehicle, playerMode, switchWeapon, reloadWeapon]);
+
   useEffect(() => {
     socketRef.current?.emit("game:telemetry", {
       speed: telemetry.speed,
@@ -3677,11 +4460,23 @@ export default function LaptopGameApp() {
       boost: telemetry.boost,
       playerMode,
       nearCar,
+      weaponName: currentWeapon.name,
+      ammo: currentAmmo.mag,
+      reserveAmmo: currentAmmo.reserve,
+      hp: Math.round(playerHp),
+      kills,
     });
-  }, [playerMode, nearCar, telemetry]);
+  }, [
+    playerMode,
+    nearCar,
+    telemetry,
+    currentWeapon.name,
+    currentAmmo.mag,
+    currentAmmo.reserve,
+    playerHp,
+    kills,
+  ]);
 
-  // Keep the interaction prompt and phone telemetry synced with driver-side door proximity
-  // Keep the interaction prompt and phone telemetry synced every 100ms in ALL modes
   useEffect(() => {
     const interval = window.setInterval(() => {
       let canReach = false;
@@ -3719,17 +4514,24 @@ export default function LaptopGameApp() {
         boost: telemetry.boost,
         playerMode,
         nearCar: canReach,
+        weaponName: currentWeapon.name,
+        ammo: currentAmmo.mag,
+        reserveAmmo: currentAmmo.reserve,
+        hp: Math.round(playerHp),
+        kills,
       });
     }, 100);
     return () => window.clearInterval(interval);
-  }, [playerMode, speedKmh, telemetry]);
-
-  useEffect(() => {
-    return () => {
-      if (transitionTimerRef.current)
-        window.clearTimeout(transitionTimerRef.current);
-    };
-  }, []);
+  }, [
+    playerMode,
+    speedKmh,
+    telemetry,
+    currentWeapon.name,
+    currentAmmo.mag,
+    currentAmmo.reserve,
+    playerHp,
+    kills,
+  ]);
 
   useEffect(() => {
     const socket = io(getSocketUrl(), { transports: ["websocket", "polling"] });
@@ -3744,6 +4546,10 @@ export default function LaptopGameApp() {
       remoteInputRef.current.crouch = Boolean(data.crouch);
       remoteInputRef.current.sprint = Boolean(data.sprint);
       remoteInputRef.current.autoRun = Boolean(data.autoRun);
+      remoteInputRef.current.fire = Boolean(data.fire);
+      remoteInputRef.current.aim = Boolean(data.aim);
+      setRemoteFiring(Boolean(data.fire));
+      setRemoteAiming(Boolean(data.aim));
       remoteInputRef.current.steer = Number(data.steer) || 0;
       remoteInputRef.current.moveX = Number(data.moveX) || 0;
       remoteInputRef.current.moveY = Number(data.moveY) || 0;
@@ -3760,6 +4566,8 @@ export default function LaptopGameApp() {
       if (action === "camera") cycleCamera();
       if (action === "reset") remoteInputRef.current.reset = true;
       if (action === "toggleVehicle") toggleVehicle();
+      if (action === "switchWeapon") switchWeapon();
+      if (action === "reloadWeapon") reloadWeapon();
       if (typeof action === "string" && action.startsWith("emote:")) {
         playEmote(action.split(":")[1]);
       }
@@ -3773,7 +4581,7 @@ export default function LaptopGameApp() {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [cycleCamera, toggleVehicle, playEmote]);
+  }, [cycleCamera, toggleVehicle, playEmote, switchWeapon, reloadWeapon]);
 
   const handleCollision = useCallback((impactSpeed) => {
     const intensity = Math.max(0, Math.min(1, impactSpeed / 28));
@@ -3842,13 +4650,13 @@ export default function LaptopGameApp() {
           far={320}
         />
         <Suspense fallback={null}>
-          <OpenWorldMap collidersRef={collidersRef} />
+          <OpenWorldMap collidersRef={collidersRef} mapKey={mapPreset} />
         </Suspense>
         <DrivingWorld presetKey={scenePreset} />
         <Suspense fallback={null}>
           <BMWM4
             ref={carRef}
-            doorOpen={doorOpen}
+            doorProgressRef={doorProgressRef}
             onWheelsReady={handleWheelsReady}
             onError={handleModelError}
           />
@@ -3856,15 +4664,28 @@ export default function LaptopGameApp() {
             ref={characterRef}
             animation={playerMode === "driving" ? "drivingSeat" : charAnimation}
             visible={true}
-            steerValue={currentSteer}
+            weaponId={playerMode === "onFoot" ? weaponId : "fist"}
+            aiming={isAiming || isArmed}
+            firing={isFiring}
+            aimPitch={cameraPitchRef.current}
             onAnimationFinished={handleCharacterAnimationFinished}
+            onAnimationProgress={handleAnimationProgress}
+          />
+          <CombatManager
+            enabled={playerMode === "onFoot"}
+            characterRef={characterRef}
+            collidersRef={collidersRef}
+            weaponId={weaponId}
+            firing={isFiring}
+            onShotEvaluated={handleShotEvaluated}
+            onPlayerDamaged={handlePlayerDamaged}
           />
         </Suspense>
         <VehicleOccupantSync
           carRef={carRef}
           characterRef={characterRef}
           playerMode={playerMode}
-          transitionStartRef={transitionStartRef}
+          doorProgressRef={doorProgressRef}
         />
         <CarController
           carRef={carRef}
@@ -3882,6 +4703,7 @@ export default function LaptopGameApp() {
           collidersRef={collidersRef}
           enabled={playerMode === "onFoot"}
           emoteActive={emoteActive}
+          combatStanceActive={isAiming || isFiring}
           cameraYawRef={cameraYawRef}
           remoteInputRef={remoteInputRef}
           onAnimationChange={setCharAnimation}
@@ -3897,17 +4719,42 @@ export default function LaptopGameApp() {
           remoteInputRef={remoteInputRef}
           cameraMode={cameraMode}
           isCharacterMode={isCharacterMode}
+          isArmed={isArmed}
+          isAiming={isAiming}
           orbitYawRef={cameraYawRef}
+          orbitPitchRef={cameraPitchRef}
         />
       </Canvas>
+
+      {/* Free Fire Dynamic Crosshair & Hitmarker */}
+      {playerMode === "onFoot" && weaponId !== "fist" && (
+        <div
+          className={`ff-crosshair ${isAiming ? "aiming" : ""} ${isFiring ? "firing" : ""}`}
+        >
+          <span className="ff-ch-line top" />
+          <span className="ff-ch-line right" />
+          <span className="ff-ch-line bottom" />
+          <span className="ff-ch-line left" />
+          <span className="ff-ch-dot" />
+          {hitMarker && (
+            <div
+              className={
+                hitMarker.headshot ? "ff-hitmarker headshot" : "ff-hitmarker"
+              }
+            />
+          )}
+        </div>
+      )}
 
       <div className="topbar">
         <div className="brand-lockup">
           <span className="brand-mark">M</span>
           <div>
-            <div className="eyebrow">BMW M PERFORMANCE</div>
+            <div className="eyebrow">BMW M PERFORMANCE · BATTLE ROYALE</div>
             <div className="brand-title">
-              {isCharacterMode ? "OPEN WORLD CHARACTER" : "M4 COMPETITION"}
+              {isCharacterMode
+                ? `COMBAT MODE · ${kills} ELIMINATIONS`
+                : "M4 COMPETITION"}
             </div>
           </div>
         </div>
@@ -4012,27 +4859,88 @@ export default function LaptopGameApp() {
       )}
 
       {playerMode === "onFoot" && (
-        <section className="character-action-panel">
-          <div className="character-panel-heading">CHARACTER ACTIONS</div>
-          <div className="character-emote-grid">
-            {EMOTES.map((emote) => (
+        <>
+          {/* Free Fire Weapon Slot & Ammo HUD (Top Right) */}
+          <div className="ff-weapon-hud">
+            <div className="ff-weapon-slots">
+              {WEAPON_ORDER.map((id) => {
+                const w = WEAPONS[id];
+                const slot = ammoState[id];
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    className={`ff-weapon-card ${weaponId === id ? "active" : ""}`}
+                    onClick={() => {
+                      setReloading(false);
+                      setWeaponId(id);
+                    }}
+                  >
+                    <span className="ff-weapon-name">{w.name}</span>
+                    {id !== "fist" && (
+                      <span className="ff-weapon-ammo">
+                        {reloading && weaponId === id
+                          ? "RELOADING..."
+                          : `${slot.mag} / ${slot.reserve}`}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="ff-combat-actions-row">
               <button
-                key={emote.id}
                 type="button"
-                className="character-emote-btn"
-                disabled={emoteActive}
-                onClick={() => playEmote(emote.id)}
+                className="ff-mini-btn"
+                onClick={reloadWeapon}
+                disabled={reloading || weaponId === "fist"}
               >
-                <span className="emote-key">{emote.key}</span>
-                {emote.label}
+                R · RELOAD
               </button>
-            ))}
+              <button
+                type="button"
+                className="ff-mini-btn"
+                onClick={switchWeapon}
+              >
+                Q · SWITCH
+              </button>
+            </div>
           </div>
-          <div className="character-control-hint">
-            WASD / PHONE JOYSTICK MOVE · SWIPE PHONE / DRAG MOUSE TO TURN ·
-            SHIFT SPRINT · SPACE JUMP · F ENTER CAR
-          </div>
-        </section>
+
+          <section className="character-action-panel">
+            <div className="ff-hp-bar-wrap">
+              <div className="ff-hp-label">
+                <span>HP</span>
+                <span>{Math.round(playerHp)} / 100</span>
+              </div>
+              <div className="ff-hp-track">
+                <div
+                  className="ff-hp-fill"
+                  style={{ width: `${Math.max(0, playerHp)}%` }}
+                />
+              </div>
+            </div>
+
+            <div className="character-emote-grid">
+              {EMOTES.map((emote) => (
+                <button
+                  key={emote.id}
+                  type="button"
+                  className="character-emote-btn"
+                  disabled={emoteActive}
+                  onClick={() => playEmote(emote.id)}
+                >
+                  <span className="emote-key">{emote.key}</span>
+                  {emote.label}
+                </button>
+              ))}
+            </div>
+            <div className="character-control-hint">
+              LEFT CLICK FIRE · RIGHT CLICK SCOPE · Q SWITCH GUN · R RELOAD ·
+              WASD MOVE · F ENTER BMW
+            </div>
+          </section>
+        </>
       )}
 
       {(interactionMessage || isTransitioning) && (
@@ -4061,6 +4969,8 @@ export default function LaptopGameApp() {
         onSteerHudSideChange={setSteerHudSide}
         scenePreset={scenePreset}
         onScenePresetChange={setScenePreset}
+        mapPreset={mapPreset}
+        onMapPresetChange={setMapPreset}
       />
       {modelError && <div className="error-banner">{modelError}</div>}
       <div className="corner-status">
@@ -4070,7 +4980,7 @@ export default function LaptopGameApp() {
         {playerMode === "driving"
           ? `DRIVING M4 · ${Math.round(speedKmh)} KM/H`
           : playerMode === "onFoot"
-            ? "ON FOOT · EXPLORE THE WORLD"
+            ? `COMBAT READY · ${currentWeapon.name}`
             : playerMode.toUpperCase()}
       </div>
       <Loader containerStyles={{ background: "rgba(9,13,20,.92)" }} />
@@ -4086,7 +4996,7 @@ FILE: components/UI/GameModals.jsx
 ```jsx
 import React from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { SCENE_PRESETS } from "../../config/gameConstants";
+import { MAP_PRESETS, SCENE_PRESETS } from "../../config/gameConstants";
 import Icons from "./Icons";
 
 export function QrConnectModal({ open, onClose, networkUrl, onCopyUrl }) {
@@ -4141,6 +5051,8 @@ export function GameSettingsModal({
   onSteerHudSideChange,
   scenePreset,
   onScenePresetChange,
+  mapPreset,
+  onMapPresetChange,
 }) {
   if (!open) return null;
 
@@ -4156,6 +5068,26 @@ export function GameSettingsModal({
             <Icons.Close />
           </button>
         </div>
+
+        {onMapPresetChange && (
+          <div className="mc-setting-group">
+            <div className="mc-setting-label">BATTLE / DRIVING MAP</div>
+            <div className="mc-segmented">
+              {Object.entries(MAP_PRESETS).map(([key, item]) => (
+                <button
+                  key={key}
+                  type="button"
+                  className={
+                    mapPreset === key ? "mc-seg-btn active" : "mc-seg-btn"
+                  }
+                  onClick={() => onMapPresetChange(key)}
+                >
+                  <span>{item.label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="mc-setting-group">
           <div className="mc-setting-label">STEERING HUD POSITION</div>
@@ -4647,6 +5579,8 @@ export default function FollowCamera({
   remoteInputRef,
   cameraMode,
   isCharacterMode,
+  isArmed = false,
+  isAiming = false,
   orbitYawRef,
   orbitPitchRef,
 }) {
@@ -4790,114 +5724,110 @@ export default function FollowCamera({
       }
     }
 
-    if (isCharacterMode) {
-      // Consume immediate horizontal swipe delta from phone trackpad
-      if (remoteInputRef?.current) {
-        const swipeDX = remoteInputRef.current.lookDeltaX || 0;
-        const swipeDY = remoteInputRef.current.lookDeltaY || 0;
-        if (swipeDX !== 0 || swipeDY !== 0) {
-          yawTarget.current -= swipeDX;
-          pitchTarget.current = THREE.MathUtils.clamp(
-            pitchTarget.current + swipeDY,
-            MIN_PITCH,
-            MAX_PITCH,
-          );
-          remoteInputRef.current.lookDeltaX = 0;
-          remoteInputRef.current.lookDeltaY = 0;
-        }
-      }
+    if (orbitYawRef) orbitYawRef.current = yaw.current;
+    if (orbitPitchRef) orbitPitchRef.current = pitch.current;
 
-      const remoteLookX = remoteInputRef?.current?.lookX || 0;
-      const remoteLookY = remoteInputRef?.current?.lookY || 0;
-      if (Math.abs(remoteLookX) > 0.04 || Math.abs(remoteLookY) > 0.04) {
-        yawTarget.current -= remoteLookX * REMOTE_LOOK_SPEED * dt;
-        pitchTarget.current = THREE.MathUtils.clamp(
-          pitchTarget.current - remoteLookY * REMOTE_LOOK_SPEED * 0.7 * dt,
-          MIN_PITCH,
-          MAX_PITCH,
-        );
-      }
+    const targetFov = isAiming ? 30 : 44;
+    if (Math.abs(camera.fov - targetFov) > 0.1) {
+      camera.fov = THREE.MathUtils.lerp(
+        camera.fov,
+        targetFov,
+        1 - Math.exp(-14 * dt),
+      );
+      camera.updateProjectionMatrix();
+    }
 
-      const yawAlpha = 1 - Math.exp(-ORBIT_DAMP * dt);
-      yaw.current += (yawTarget.current - yaw.current) * yawAlpha;
-      pitch.current += (pitchTarget.current - pitch.current) * yawAlpha;
+    const distance = isAiming ? 2.35 : CHARACTER_CAMERA_DISTANCE;
+    const shoulderOffset = isAiming ? 0.62 : isArmed ? 0.45 : 0;
+    const horizontal = Math.cos(pitch.current) * distance;
+    const vertical = Math.sin(pitch.current) * distance;
 
-      if (orbitYawRef) orbitYawRef.current = yaw.current;
-      if (orbitPitchRef) orbitPitchRef.current = pitch.current;
+    const rightX = Math.cos(yaw.current) * shoulderOffset;
+    const rightZ = -Math.sin(yaw.current) * shoulderOffset;
 
-      const distance = CHARACTER_CAMERA_DISTANCE;
-      const horizontal = Math.cos(pitch.current) * distance;
-      const vertical = Math.sin(pitch.current) * distance;
+    const cameraX =
+      target.position.x + Math.sin(yaw.current) * horizontal + rightX;
+    const cameraZ =
+      target.position.z + Math.cos(yaw.current) * horizontal + rightZ;
+    const cameraY = target.position.y + CHARACTER_CAMERA_HEIGHT + vertical;
 
-      const cameraX = target.position.x + Math.sin(yaw.current) * horizontal;
-      const cameraZ = target.position.z + Math.cos(yaw.current) * horizontal;
-      const cameraY = target.position.y + CHARACTER_CAMERA_HEIGHT + vertical;
+    desiredPosition.current.set(cameraX, cameraY, cameraZ);
+    camera.position.lerp(desiredPosition.current, 1 - Math.exp(-14 * dt));
 
-      desiredPosition.current.set(cameraX, cameraY, cameraZ);
-      camera.position.lerp(desiredPosition.current, 1 - Math.exp(-12 * dt));
+    const lookForwardDist = isAiming ? 24 : 8;
+    const forwardX = -Math.sin(yaw.current) * Math.cos(pitch.current);
+    const forwardY = -Math.sin(pitch.current);
+    const forwardZ = -Math.cos(yaw.current) * Math.cos(pitch.current);
 
+    if (isArmed || isAiming) {
+      lookTarget.current.set(
+        target.position.x + rightX + forwardX * lookForwardDist,
+        target.position.y + 1.42 + forwardY * lookForwardDist,
+        target.position.z + rightZ + forwardZ * lookForwardDist,
+      );
+    } else {
       lookTarget.current
         .copy(target.position)
         .add(new THREE.Vector3(0, 1.35, 0));
-
-      currentLook.current.lerp(lookTarget.current, 1 - Math.exp(-16 * dt));
-      camera.lookAt(currentLook.current);
-      return;
     }
 
-    const phys = physicsStateRef?.current || {
-      vx: 0,
-      vy: 0,
-      steering: 0,
-      boost: false,
-    };
-
-    const carYaw = target.rotation.y;
-
-    if (cameraMode === "hood") {
-      const offset = new THREE.Vector3(...camPreset.offset).applyAxisAngle(
-        new THREE.Vector3(0, 1, 0),
-        carYaw,
-      );
-
-      camera.position.copy(target.position).add(offset);
-
-      const look = new THREE.Vector3(
-        12,
-        camPreset.lookY,
-        -phys.steering * 3,
-      ).applyAxisAngle(new THREE.Vector3(0, 1, 0), carYaw);
-
-      lookTarget.current.copy(target.position).add(look);
-      camera.lookAt(lookTarget.current);
-      return;
-    }
-
-    const driftSwing = THREE.MathUtils.clamp(phys.vy * 0.14, -1.6, 1.6);
-    const speedPullback = THREE.MathUtils.clamp(
-      Math.abs(phys.vx) * 0.035,
-      0,
-      1.4,
-    );
-
-    const offset = new THREE.Vector3(
-      camPreset.offset[0] - speedPullback,
-      camPreset.offset[1],
-      camPreset.offset[2] + driftSwing,
-    ).applyAxisAngle(new THREE.Vector3(0, 1, 0), carYaw);
-
-    desiredPosition.current.copy(target.position).add(offset);
-    camera.position.lerp(desiredPosition.current, 1 - Math.exp(-6.5 * dt));
-
-    const lookAhead = new THREE.Vector3(
-      2.2,
-      camPreset.lookY,
-      -phys.steering * 1.1,
-    ).applyAxisAngle(new THREE.Vector3(0, 1, 0), carYaw);
-
-    lookTarget.current.copy(target.position).add(lookAhead);
-    currentLook.current.lerp(lookTarget.current, 1 - Math.exp(-10 * dt));
+    currentLook.current.lerp(lookTarget.current, 1 - Math.exp(-18 * dt));
     camera.lookAt(currentLook.current);
+    return;
+
+    // const phys = physicsStateRef?.current || {
+    //   vx: 0,
+    //   vy: 0,
+    //   steering: 0,
+    //   boost: false,
+    // };
+
+    // const carYaw = target.rotation.y;
+
+    // if (cameraMode === "hood") {
+    //   const offset = new THREE.Vector3(...camPreset.offset).applyAxisAngle(
+    //     new THREE.Vector3(0, 1, 0),
+    //     carYaw,
+    //   );
+
+    //   camera.position.copy(target.position).add(offset);
+
+    //   const look = new THREE.Vector3(
+    //     12,
+    //     camPreset.lookY,
+    //     -phys.steering * 3,
+    //   ).applyAxisAngle(new THREE.Vector3(0, 1, 0), carYaw);
+
+    //   lookTarget.current.copy(target.position).add(look);
+    //   camera.lookAt(lookTarget.current);
+    //   return;
+    // }
+
+    // const driftSwing = THREE.MathUtils.clamp(phys.vy * 0.14, -1.6, 1.6);
+    // const speedPullback = THREE.MathUtils.clamp(
+    //   Math.abs(phys.vx) * 0.035,
+    //   0,
+    //   1.4,
+    // );
+
+    // const offset = new THREE.Vector3(
+    //   camPreset.offset[0] - speedPullback,
+    //   camPreset.offset[1],
+    //   camPreset.offset[2] + driftSwing,
+    // ).applyAxisAngle(new THREE.Vector3(0, 1, 0), carYaw);
+
+    // desiredPosition.current.copy(target.position).add(offset);
+    // camera.position.lerp(desiredPosition.current, 1 - Math.exp(-6.5 * dt));
+
+    // const lookAhead = new THREE.Vector3(
+    //   2.2,
+    //   camPreset.lookY,
+    //   -phys.steering * 1.1,
+    // ).applyAxisAngle(new THREE.Vector3(0, 1, 0), carYaw);
+
+    // lookTarget.current.copy(target.position).add(lookAhead);
+    // currentLook.current.lerp(lookTarget.current, 1 - Math.exp(-10 * dt));
+    // camera.lookAt(currentLook.current);
   });
 
   return null;
@@ -4913,11 +5843,19 @@ import React, { useEffect, useMemo, useRef } from "react";
 import { useGLTF } from "@react-three/drei";
 import * as THREE from "three";
 import { MeshBVH, CENTER, acceleratedRaycast } from "three-mesh-bvh";
-import mapUrl from "../../assets/models/gt_racing_2_-_mount_rainier.glb";
+
+import rainierUrl from "../../assets/models/gt_racing_2_-_mount_rainier.glb";
+import bermudaUrl from "../../assets/models/bermuda_remastered__free_fire.glb";
+import coteUrl from "../../assets/models/gt_racing_2_-_cote_d_azur.glb";
+
+const MAP_URLS = {
+  bermuda: bermudaUrl,
+  rainier: rainierUrl,
+  cotedazur: coteUrl,
+};
 
 const SKY_NAME = /sky|cloud|dome|horizon|atmos/i;
 
-// Sky domes are usually huge BackSide spheres. They must never be collidable.
 function isSkyLike(mesh) {
   for (let node = mesh; node; node = node.parent) {
     if (SKY_NAME.test(node.name)) return true;
@@ -4926,18 +5864,9 @@ function isSkyLike(mesh) {
   return mats.some((m) => m && m.side === THREE.BackSide);
 }
 
-/**
- * GT Racing 2 - Cote d'Azur map from Sketchfab.
- * The map uses Y as its vertical axis, so it is not rotated.
- * Its X/Z center is shifted to the world origin while authored elevations
- * are preserved.
- *
- * Every mesh also gets a BVH so the car can raycast against the map cheaply.
- * Meshes are registered in `collidersRef` in small time slices so entering
- * Drive mode doesn't freeze the page.
- */
-export default function OpenWorldMap({ collidersRef }) {
-  const { scene } = useGLTF(mapUrl);
+export default function OpenWorldMap({ collidersRef, mapKey = "bermuda" }) {
+  const activeUrl = MAP_URLS[mapKey] || MAP_URLS.rainier;
+  const { scene } = useGLTF(activeUrl);
   const groupRef = useRef(null);
 
   const mapData = useMemo(() => {
@@ -4954,18 +5883,6 @@ export default function OpenWorldMap({ collidersRef }) {
       object.frustumCulled = true;
     });
 
-    console.info("[OpenWorldMap] Loaded map", {
-      meshCount: (() => {
-        let count = 0;
-        mapScene.traverse((object) => {
-          if (object.isMesh) count += 1;
-        });
-        return count;
-      })(),
-      size: bounds.getSize(new THREE.Vector3()).toArray(),
-      center: center.toArray(),
-    });
-
     return {
       scene: mapScene,
       position: [-center.x, 0, -center.z],
@@ -4976,7 +5893,6 @@ export default function OpenWorldMap({ collidersRef }) {
     const group = groupRef.current;
     if (!group || !collidersRef) return undefined;
 
-    // Include the group's offset in every world matrix / box below.
     group.updateWorldMatrix(true, true);
 
     const meshes = [];
@@ -5000,10 +5916,7 @@ export default function OpenWorldMap({ collidersRef }) {
       while (index < meshes.length && performance.now() - start < 12) {
         const mesh = meshes[index++];
 
-        if (isSkyLike(mesh)) {
-          console.info("[OpenWorldMap] Skipping sky-like mesh:", mesh.name);
-          continue;
-        }
+        if (isSkyLike(mesh)) continue;
 
         try {
           const geometry = mesh.geometry;
@@ -5025,21 +5938,6 @@ export default function OpenWorldMap({ collidersRef }) {
         timer = window.setTimeout(buildSlice, 0);
       } else {
         colliders.ready = true;
-        console.info(
-          `[OpenWorldMap] Collision ready: ${colliders.length} meshes`,
-        );
-        // Diagnostic: the highest collidable meshes. If the car still spawns
-        // too high, one of these is the culprit.
-        console.table(
-          [...colliders]
-            .sort((a, b) => b.box.max.y - a.box.max.y)
-            .slice(0, 8)
-            .map(({ mesh, box }) => ({
-              name: mesh.name,
-              minY: +box.min.y.toFixed(1),
-              maxY: +box.max.y.toFixed(1),
-            })),
-        );
       }
     };
 
@@ -5059,7 +5957,7 @@ export default function OpenWorldMap({ collidersRef }) {
   );
 }
 
-useGLTF.preload(mapUrl);
+useGLTF.preload(rainierUrl);
 ```
 
 ===============================================================================
@@ -5111,6 +6009,68 @@ export const SCENE_PRESETS = {
     gridSection: "#2b3e57",
   },
 };
+
+export const MAP_PRESETS = {
+  bermuda: {
+    id: "bermuda",
+    label: "Bermuda FF",
+  },
+  rainier: {
+    id: "rainier",
+    label: "Mt. Rainier",
+  },
+  cotedazur: {
+    id: "cotedazur",
+    label: "Côte d'Azur",
+  },
+};
+
+export const WEAPONS = {
+  m4a1: {
+    id: "m4a1",
+    name: "M4A1 RIFLE",
+    magSize: 30,
+    reserveAmmo: 120,
+    fireRate: 0.11, // seconds per shot
+    damage: 28,
+    headshotDamage: 112,
+    range: 140,
+    recoilPitch: 0.014,
+    spread: 0.008,
+    reloadTime: 1.6,
+    color: "#2d79ff",
+  },
+  mp40: {
+    id: "mp40",
+    name: "MP40 SMG",
+    magSize: 24,
+    reserveAmmo: 96,
+    fireRate: 0.075,
+    damage: 22,
+    headshotDamage: 88,
+    range: 75,
+    recoilPitch: 0.018,
+    spread: 0.018,
+    reloadTime: 1.3,
+    color: "#ff9f0a",
+  },
+  fist: {
+    id: "fist",
+    name: "UNARMED",
+    magSize: 0,
+    reserveAmmo: 0,
+    fireRate: 0.5,
+    damage: 0,
+    headshotDamage: 0,
+    range: 0,
+    recoilPitch: 0,
+    spread: 0,
+    reloadTime: 0,
+    color: "#8fa2b8",
+  },
+};
+
+export const WEAPON_ORDER = ["m4a1", "mp40", "fist"];
 
 export const CAMERA_MODES = [
   {
@@ -6816,6 +7776,258 @@ button {
   border-color: #ffffff;
   box-shadow: 0 0 22px rgba(255, 159, 10, 0.85);
 }
+
+/* ================================================================== */
+/*  FREE FIRE COMBAT HUD, CROSSHAIR, BOTS & MOBILE FIRE CONTROLS      */
+/* ================================================================== */
+
+.ff-crosshair {
+  position: absolute;
+  z-index: 15;
+  top: 50%;
+  left: 50%;
+  width: 36px;
+  height: 36px;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  transition: transform 0.08s ease;
+}
+
+.ff-crosshair.aiming {
+  transform: translate(-50%, -50%) scale(0.68);
+}
+
+.ff-crosshair.firing {
+  transform: translate(-50%, -50%) scale(1.25);
+}
+
+.ff-ch-dot {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #ff2a5f;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 6px #ff2a5f;
+}
+
+.ff-ch-line {
+  position: absolute;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.85);
+}
+
+.ff-ch-line.top {
+  top: 2px;
+  left: 50%;
+  width: 2px;
+  height: 8px;
+  transform: translateX(-50%);
+}
+
+.ff-ch-line.bottom {
+  bottom: 2px;
+  left: 50%;
+  width: 2px;
+  height: 8px;
+  transform: translateX(-50%);
+}
+
+.ff-ch-line.left {
+  left: 2px;
+  top: 50%;
+  width: 8px;
+  height: 2px;
+  transform: translateY(-50%);
+}
+
+.ff-ch-line.right {
+  right: 2px;
+  top: 50%;
+  width: 8px;
+  height: 2px;
+  transform: translateY(-50%);
+}
+
+.ff-hitmarker {
+  position: absolute;
+  inset: 5px;
+  border: 2px solid #ffffff;
+  transform: rotate(45deg);
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.8);
+}
+
+.ff-hitmarker.headshot {
+  border-color: #ff2a5f;
+  box-shadow: 0 0 14px #ff2a5f;
+}
+
+.ff-weapon-hud {
+  position: absolute;
+  z-index: 8;
+  top: 86px;
+  right: 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 220px;
+}
+
+.ff-weapon-slots {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ff-weapon-card {
+  padding: 10px 14px;
+  border-radius: 11px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(8, 14, 24, 0.82);
+  backdrop-filter: blur(12px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+
+.ff-weapon-card.active {
+  border-color: #ff9f0a;
+  background: linear-gradient(135deg, rgba(255, 159, 10, 0.28), rgba(12, 20, 34, 0.92));
+  box-shadow: 0 0 20px rgba(255, 159, 10, 0.35);
+}
+
+.ff-weapon-name {
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: 1.2px;
+}
+
+.ff-weapon-ammo {
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 16px;
+  font-weight: 800;
+  color: #00d2ff;
+}
+
+.ff-combat-actions-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.ff-mini-btn {
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(15, 24, 38, 0.86);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  cursor: pointer;
+}
+
+.ff-hp-bar-wrap {
+  margin-bottom: 10px;
+}
+
+.ff-hp-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 1.4px;
+  color: #dce6f2;
+  margin-bottom: 4px;
+}
+
+.ff-hp-track {
+  width: 100%;
+  height: 8px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+
+.ff-hp-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #32d74b, #00d2ff);
+  transition: width 0.15s ease;
+}
+
+.ff-dmg-popup {
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 22px;
+  font-weight: 800;
+  color: #ffdd57;
+  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.95);
+  white-space: nowrap;
+  pointer-events: none;
+  animation: ffFloatUp 0.65s ease-out forwards;
+}
+
+.ff-dmg-popup.ff-dmg-headshot {
+  font-size: 27px;
+  color: #ff2a5f;
+}
+
+@keyframes ffFloatUp {
+  0% {
+    opacity: 1;
+    transform: translateY(0) scale(0.9);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-28px) scale(1.15);
+  }
+}
+
+.ff-bot-nametag {
+  pointer-events: none;
+}
+
+.ff-bot-hp-track {
+  width: 54px;
+  height: 6px;
+  border-radius: 99px;
+  background: rgba(0, 0, 0, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  overflow: hidden;
+}
+
+.ff-bot-hp-fill {
+  height: 100%;
+  background: #ff2a5f;
+}
+
+.mc-fire-btn {
+  border: 2px solid rgba(255, 42, 95, 0.75);
+  background: linear-gradient(180deg, rgba(165, 20, 56, 0.92) 0%, rgba(75, 10, 26, 0.96) 100%);
+  color: #ffffff;
+}
+
+.mc-fire-btn.is-pressed {
+  transform: scale(0.94);
+  background: #ff2a5f;
+  box-shadow: 0 0 26px rgba(255, 42, 95, 0.85);
+}
+
+.mc-aim-btn {
+  border: 1.5px solid rgba(255, 214, 10, 0.65);
+  background: linear-gradient(180deg, rgba(72, 56, 12, 0.9) 0%, rgba(34, 26, 6, 0.95) 100%);
+  color: #ffd60a;
+}
+
+.mc-aim-btn.is-pressed {
+  transform: scale(0.94);
+  background: #ffd60a;
+  color: #090d14;
+  box-shadow: 0 0 22px rgba(255, 214, 10, 0.75);
+}
 ```
 
 ===============================================================================
@@ -6924,4 +8136,4 @@ export function extractTiltDegrees(event, isForcedLandscape) {
 
 Generated by ctx
 
-Total Files: 25
+Total Files: 26

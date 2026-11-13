@@ -25,13 +25,13 @@ const JUMP_BUFFER = 0.14;
 const CHARACTER_RADIUS = 0.34;
 const CHARACTER_HEIGHT = 1.8;
 
-const STEP_HEIGHT = 0.42;
-const MAX_GROUND_DROP = 6.0;
+const STEP_HEIGHT = 0.55;
+const MAX_GROUND_DROP = 15.0;
 
 const DEFAULT_GROUND_Y = 0;
 
-const COLLIDER_REFRESH_DISTANCE = 5;
-const COLLIDER_SEARCH_RADIUS = 22;
+const COLLIDER_REFRESH_DISTANCE = 4;
+const COLLIDER_SEARCH_RADIUS = 60;
 
 const CAR_COLLISION_HALF_LEN = 1.72;
 const CAR_COLLISION_HALF_WID = 0.78;
@@ -135,13 +135,13 @@ function getNearbyMeshes(cache, colliderEntries, position) {
 function findGround(character, meshes) {
   _origin.set(
     character.position.x,
-    character.position.y + 2.5,
+    character.position.y + 3.0,
     character.position.z,
   );
 
   _groundRaycaster.set(_origin, DOWN);
   _groundRaycaster.near = 0;
-  _groundRaycaster.far = 2.5 + MAX_GROUND_DROP;
+  _groundRaycaster.far = 3.0 + MAX_GROUND_DROP;
 
   const hits = _groundRaycaster.intersectObjects(meshes, false);
   let bestGroundY = null;
@@ -151,10 +151,27 @@ function findGround(character, meshes) {
     const groundY = hit.point.y;
 
     if (groundY > character.position.y + STEP_HEIGHT) continue;
-    if (groundY < character.position.y - MAX_GROUND_DROP) continue;
 
     if (bestGroundY === null || groundY > bestGroundY) {
       bestGroundY = groundY;
+    }
+  }
+
+  // High-altitude recovery if character is in mid-air or dropping from terrain
+  if (bestGroundY === null) {
+    _origin.set(
+      character.position.x,
+      Math.max(character.position.y + 20, 200),
+      character.position.z,
+    );
+    _groundRaycaster.set(_origin, DOWN);
+    _groundRaycaster.far = 400;
+    const recoveryHits = _groundRaycaster.intersectObjects(meshes, false);
+    for (const hit of recoveryHits) {
+      if (!isGroundFace(hit)) continue;
+      if (bestGroundY === null || hit.point.y > bestGroundY) {
+        bestGroundY = hit.point.y;
+      }
     }
   }
 
@@ -165,7 +182,7 @@ function moveWithCollision(character, displacement, meshes) {
   _remaining.copy(displacement);
   if (_remaining.lengthSq() < 0.000001) return;
 
-  const heights = [0.42, CHARACTER_HEIGHT * 0.52, CHARACTER_HEIGHT * 0.85];
+  const heights = [0.35, CHARACTER_HEIGHT * 0.5, CHARACTER_HEIGHT * 0.85];
 
   for (let pass = 0; pass < 2; pass += 1) {
     const distance = _remaining.length();
@@ -190,12 +207,12 @@ function moveWithCollision(character, displacement, meshes) {
           .copy(hit.face.normal)
           .transformDirection(hit.object.matrixWorld);
 
-        if (Math.abs(_normal.y) > 0.55) continue;
+        // Discard walkable slopes and floor geometry
+        if (Math.abs(_normal.y) > 0.6) continue;
 
         if (!closestHit || hit.distance < closestHit.distance) {
           closestHit = hit;
         }
-        break;
       }
     }
 
@@ -214,6 +231,12 @@ function moveWithCollision(character, displacement, meshes) {
 
     if (_normal.dot(_direction) > 0) {
       _normal.negate();
+    }
+
+    // Active push-out to prevent penetrating inside walls or corners
+    if (closestHit.distance < CHARACTER_RADIUS) {
+      const penetration = CHARACTER_RADIUS - closestHit.distance;
+      character.position.addScaledVector(_normal, penetration + 0.015);
     }
 
     const allowedDistance = Math.max(0, closestHit.distance - CHARACTER_RADIUS);
@@ -273,6 +296,9 @@ function selectAnimation({
   running,
   crouching,
   speed,
+  combatStanceActive = false,
+  forwardInput = 0,
+  strafeInput = 0,
 }) {
   if (airborne) return "jump";
 
@@ -282,6 +308,13 @@ function selectAnimation({
 
   if (!hasInput || speed < 0.2) {
     return "idle";
+  }
+
+  if (combatStanceActive) {
+    if (forwardInput < -0.2) return "backward";
+    if (Math.abs(strafeInput) > 0.4 && Math.abs(forwardInput) < 0.3) {
+      return strafeInput > 0 ? "strafeRight" : "strafeLeft";
+    }
   }
 
   if (sprinting) return "sprint";
@@ -300,6 +333,7 @@ export default function CharacterController({
   collidersRef,
   enabled,
   emoteActive = false,
+  combatStanceActive = false,
   cameraYawRef,
   remoteInputRef,
   onAnimationChange,
@@ -380,6 +414,7 @@ export default function CharacterController({
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", clearKeys);
     };
+    
   }, [onEmote]);
 
   useEffect(() => {
@@ -516,7 +551,21 @@ export default function CharacterController({
     /* Character facing                                           */
     /* ---------------------------------------------------------- */
 
-    if (hasInput) {
+    /* ---------------------------------------------------------- */
+    /* Character facing                                           */
+    /* ---------------------------------------------------------- */
+
+    if (combatStanceActive) {
+      // Face directly along the camera sightline during ADS or firing
+      const targetYaw = camYaw + Math.PI;
+      let angleDifference = targetYaw - character.rotation.y;
+      angleDifference = Math.atan2(
+        Math.sin(angleDifference),
+        Math.cos(angleDifference),
+      );
+      const turnAlpha = 1 - Math.exp(-TURN_RATE * 1.8 * dt);
+      character.rotation.y += angleDifference * turnAlpha;
+    } else if (hasInput) {
       const targetYaw = Math.atan2(_wishDirection.x, _wishDirection.z);
 
       let angleDifference = targetYaw - character.rotation.y;
@@ -583,7 +632,11 @@ export default function CharacterController({
     /* Jump buffering and coyote time                             */
     /* ---------------------------------------------------------- */
 
-    const jumpDown = Boolean(input.space || remote?.jump) && !emoteActive;
+    const remoteJumpTriggered = Boolean(remote?.jumpPulse);
+    if (remote?.jumpPulse) {
+      remote.jumpPulse = false;
+    }
+    const jumpDown = Boolean(input.space || remote?.jump || remoteJumpTriggered) && !emoteActive;
 
     if (jumpDown && !jumpWasDown.current) {
       jumpBufferTimer.current = JUMP_BUFFER;
@@ -623,6 +676,14 @@ export default function CharacterController({
       airborne.current = true;
     }
 
+    // Safety check against falling below world bounds
+    if (character.position.y < -30 && groundY !== null) {
+      character.position.y = Math.max(groundY, 0);
+      v.y = 0;
+      airborne.current = false;
+      grounded.current = true;
+    }
+
     /* ---------------------------------------------------------- */
     /* Animation selection                                        */
     /* ---------------------------------------------------------- */
@@ -637,6 +698,9 @@ export default function CharacterController({
         running,
         crouching,
         speed: horizontalSpeed,
+        combatStanceActive,
+        forwardInput,
+        strafeInput,
       });
 
       if (lastAnimation.current !== nextAnimation) {

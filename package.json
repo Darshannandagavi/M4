@@ -1,0 +1,13 @@
+{
+  "name": "bmw-m4-controller-arena",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BMW M4 3D arena game with real-time mobile Free Fire & steering wheel controller.",
+  "scripts": {
+    "start": "npm --prefix client start",
+    "start:relay": "npm --prefix server start",
+    "build": "npm --prefix client run build",
+    "start:prod": "npm --prefix client run build && npm --prefix server start"
+  }
+}
+

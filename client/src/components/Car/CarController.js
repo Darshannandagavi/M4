@@ -429,26 +429,13 @@ export default function CarController({
 
   useFrame((_, rawDelta) => {
     const car = carRef.current;
-    if (!enabled || !car) return;
+    if (!car) return;
 
     const colliders = collidersRef?.current;
     if (!colliders || !colliders.ready) return;
 
-    const frameDelta = Math.min(rawDelta, 0.05);
-    if (frameDelta <= 0) return;
-
     const s = state.current;
-    const input = keys.current;
     const remote = remoteInputRef?.current;
-    s.collisionCooldown = Math.max(0, s.collisionCooldown - frameDelta);
-
-    const jumpDown = Boolean(input.j || remote?.jump);
-    if (jumpDown && !s.jumpWasDown && !s.airborne) {
-      s.airborne = true;
-      s.vy = 9.5;
-      s.vyGround = 0;
-    }
-    s.jumpWasDown = jumpDown;
 
     if (remote?.reset) {
       s.resetRequested = true;
@@ -463,9 +450,30 @@ export default function CarController({
     }
     const rigData = rig.current;
 
-    if (!s.spawned || s.resetRequested) {
+    if (!s.spawned || s.resetRequested || s.spawnedColliders !== colliders) {
+      s.spawnedColliders = colliders;
       placeCar(car, s, colliders, rigData, SPAWN.x, SPAWN.z, SPAWN.yaw);
     }
+
+    if (!enabled) return;
+
+    const frameDelta = Math.min(rawDelta, 0.05);
+    if (frameDelta <= 0) return;
+
+    const input = keys.current;
+    s.collisionCooldown = Math.max(0, s.collisionCooldown - frameDelta);
+
+    const remoteJumpTriggered = Boolean(remote?.jumpPulse);
+    if (remote?.jumpPulse) {
+      remote.jumpPulse = false;
+    }
+    const jumpDown = Boolean(input.j || remote?.jump || remoteJumpTriggered);
+    if (jumpDown && !s.jumpWasDown && !s.airborne) {
+      s.airborne = true;
+      s.vy = 9.5;
+      s.vyGround = 0;
+    }
+    s.jumpWasDown = jumpDown;
 
     const meshes = getNearbyMeshes(nearby.current, colliders, car.position);
 

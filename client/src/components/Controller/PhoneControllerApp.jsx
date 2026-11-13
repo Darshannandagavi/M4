@@ -1,16 +1,57 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
-import { io } from "socket.io-client";
 import {
   MAX_TILT_DEG,
   MAX_WHEEL_ROTATION_DEG,
   SCENE_PRESETS,
   TILT_DEADZONE_DEG,
+  WEAPONS,
+  WEAPON_ORDER,
 } from "../../config/gameConstants";
-import { extractTiltDegrees, getSocketUrl } from "../../utils/network";
+import {
+  connectRelaySocket,
+  extractTiltDegrees,
+  getPairTokenFromUrl,
+} from "../../utils/network";
 import Icons from "../UI/Icons";
 import HoldButton from "../UI/HoldButton";
+import TapButton, { findTouchById } from "../UI/TapButton";
 import SteeringWheelGraphic from "../UI/SteeringWheelGraphic";
+import {
+  BackpackSvg,
+  CarDriveSvg,
+  CrouchSoldierSvg,
+  EmoteWaveSvg,
+  EyeSvg,
+  FireBulletSvg,
+  HudLayoutSvg,
+  JumpSoldierSvg,
+  MedkitSvg,
+  MicSvg,
+  ReloadSvg,
+  ScopeSvg,
+  SpeakerSvg,
+  SprintSvg,
+  WeaponSilhouetteSvg,
+} from "../UI/FreeFireIcons";
+import {
+  FreeFireMinimapBox,
+  FreeFireTopCenterCluster,
+  FreeFireTopRightCluster,
+  getCardinalFromDeg,
+} from "../UI/FreeFireHudParts";
+import DraggableFireButton from "../UI/DraggableFireButton";
+import CustomHudElement from "../UI/CustomHudElement";
+import CustomHudEditorBar from "../UI/CustomHudEditorBar";
+import {
+  getActiveHudPresetIndex,
+  HUD_ELEMENTS,
+  loadHudLayoutPreset,
+  resetHudLayoutPreset,
+  saveHudLayoutPreset,
+  setActiveHudPresetIndex,
+} from "../../utils/customHudConfig";
+import "../UI/FreeFireHUD.css";
 
 const CONTROLLER_EMOTES = [
   { id: "wave", label: "WAVE" },
@@ -19,8 +60,25 @@ const CONTROLLER_EMOTES = [
   { id: "celebrate", label: "WIN" },
 ];
 
+const DEFAULT_AMMO_STATE = {
+  m4a1: { mag: WEAPONS.m4a1.magSize, reserve: WEAPONS.m4a1.reserveAmmo },
+  ak47: { mag: WEAPONS.ak47.magSize, reserve: WEAPONS.ak47.reserveAmmo },
+  awm: { mag: WEAPONS.awm.magSize, reserve: WEAPONS.awm.reserveAmmo },
+  mp40: { mag: WEAPONS.mp40.magSize, reserve: WEAPONS.mp40.reserveAmmo },
+  deagle: { mag: WEAPONS.deagle.magSize, reserve: WEAPONS.deagle.reserveAmmo },
+  fist: { mag: 0, reserve: 0 },
+};
+
 export default function PhoneControllerApp() {
+  const [pairToken, setPairToken] = useState(() => getPairTokenFromUrl());
+  const [pairDraft, setPairDraft] = useState(() => getPairTokenFromUrl());
+  const [pairStatus, setPairStatus] = useState({
+    linked: false,
+    activeGames: 0,
+    availablePairs: [],
+  });
   const [connected, setConnected] = useState(false);
+  const [relayStatus, setRelayStatus] = useState("connecting");
   const [steerMode, setSteerMode] = useState("wheel");
   const [steerSide, setSteerSide] = useState("left");
   const [scenePreset, setScenePreset] = useState("track");
@@ -34,10 +92,71 @@ export default function PhoneControllerApp() {
   const [wheelGrabbed, setWheelGrabbed] = useState(false);
   const [joyKnob, setJoyKnob] = useState({ x: 0, y: 0, active: false });
   const [autoRun, setAutoRun] = useState(false);
+  const [speakerMuted, setSpeakerMuted] = useState(false);
+  const [micMuted, setMicMuted] = useState(true);
+  const [aimActive, setAimActive] = useState(false);
+  const [crouchActive, setCrouchActive] = useState(false);
+  const [firingActive, setFiringActive] = useState(false);
+  const [emotesOpen, setEmotesOpen] = useState(false);
+  const [bagOpen, setBagOpen] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [fsHint, setFsHint] = useState("");
+  const [medkitHealing, setMedkitHealing] = useState(false);
+  const [customHudEditing, setCustomHudEditing] = useState(false);
+  const [selectedHudElem, setSelectedHudElem] = useState("rightFire");
+  const [activePreset, setActivePreset] = useState(() => getActiveHudPresetIndex());
+  const [hudLayout, setHudLayout] = useState(() => loadHudLayoutPreset(activePreset));
   const [swipeIndicator, setSwipeIndicator] = useState({
     active: false,
     offset: 0,
   });
+
+  const handleUpdateLayout = useCallback((id, newCfg) => {
+    setHudLayout((prev) => ({
+      ...prev,
+      [id]: newCfg,
+    }));
+  }, []);
+
+  const handleMoveLayout = useCallback((id, coords) => {
+    setHudLayout((prev) => ({
+      ...prev,
+      [id]: {
+        ...(prev[id] || HUD_ELEMENTS[id] || {}),
+        x: coords.x,
+        y: coords.y,
+      },
+    }));
+  }, []);
+
+  const handleSwitchPreset = useCallback((newPreset) => {
+    setActivePreset(newPreset);
+    setActiveHudPresetIndex(newPreset);
+    setHudLayout(loadHudLayoutPreset(newPreset));
+  }, []);
+
+  const handleResetLayout = useCallback(() => {
+    const def = resetHudLayoutPreset(activePreset);
+    setHudLayout(def);
+  }, [activePreset]);
+
+  const handleResetSelected = useCallback((id) => {
+    const def = HUD_ELEMENTS[id];
+    if (!def) return;
+    setHudLayout((prev) => ({
+      ...prev,
+      [id]: {
+        x: def.defaultX,
+        y: def.defaultY,
+        size: def.defaultSize,
+        opacity: def.defaultOpacity,
+      },
+    }));
+  }, []);
+
+  const handleSaveLayout = useCallback(() => {
+    return saveHudLayoutPreset(activePreset, hudLayout);
+  }, [activePreset, hudLayout]);
 
   const [telemetry, setTelemetry] = useState({
     speed: 0,
@@ -45,8 +164,31 @@ export default function PhoneControllerApp() {
     rpm: 850,
     drifting: false,
     boost: false,
-    playerMode: "driving",
+    playerMode: "onFoot",
+    matchStatus: "DROPPING",
+    aircraftPhase: "flying",
     nearCar: false,
+    weaponId: "m4a1",
+    weaponName: "M4A1 RIFLE",
+    ammo: 30,
+    reserveAmmo: 120,
+    reloading: false,
+    aliveCount: 7,
+    hp: 100,
+    ep: 180,
+    vestLevel: 3,
+    helmetLevel: 3,
+    medkits: 3,
+    primaryWeapon: "m4a1",
+    secondaryWeapon: "deagle",
+    ammoState: DEFAULT_AMMO_STATE,
+    matchElapsed: 0,
+    kills: 0,
+    killFeed: [],
+    posX: 0,
+    posZ: 0,
+    headingDeg: 0,
+    statusMsg: "",
   });
 
   const [isPortraitViewport, setIsPortraitViewport] = useState(() =>
@@ -65,6 +207,8 @@ export default function PhoneControllerApp() {
     crouch: false,
     sprint: false,
     autoRun: false,
+    fire: false,
+    aim: false,
     steer: 0,
     moveX: 0,
     moveY: 0,
@@ -79,21 +223,50 @@ export default function PhoneControllerApp() {
   const prevSwipePtRef = useRef(null);
   const prevFingerAngleRef = useRef(null);
   const wheelAngleDegRef = useRef(0);
+  const joyTouchIdRef = useRef(null);
+  const joyMouseDownRef = useRef(false);
+  const swipeTouchIdRef = useRef(null);
+  const swipeMouseDownRef = useRef(false);
+  const wheelTouchIdRef = useRef(null);
+  const wheelMouseDownRef = useRef(false);
+  const prevMatchStatusRef = useRef("DROPPING");
+  const fsHintTimerRef = useRef(null);
 
   useEffect(() => {
     const prevent = (e) => e.preventDefault();
     document.addEventListener("contextmenu", prevent);
     document.addEventListener("selectstart", prevent);
 
-    const onResize = () => {
-      setIsPortraitViewport(window.innerHeight > window.innerWidth);
+    const syncViewportMetrics = () => {
+      const vw = window.visualViewport?.width || window.innerWidth;
+      const vh = window.visualViewport?.height || window.innerHeight;
+      document.documentElement.style.setProperty("--mc-vw", `${Math.round(vw)}px`);
+      document.documentElement.style.setProperty("--mc-vh", `${Math.round(vh)}px`);
+      setIsPortraitViewport(vh > vw);
+      const activeFs =
+        document.fullscreenElement ||
+        document.webkitFullscreenElement ||
+        document.mozFullScreenElement ||
+        document.msFullscreenElement;
+      setIsFullscreen(Boolean(activeFs));
     };
-    window.addEventListener("resize", onResize);
+
+    syncViewportMetrics();
+    window.addEventListener("resize", syncViewportMetrics);
+    window.addEventListener("orientationchange", syncViewportMetrics);
+    window.visualViewport?.addEventListener("resize", syncViewportMetrics);
+    document.addEventListener("fullscreenchange", syncViewportMetrics);
+    document.addEventListener("webkitfullscreenchange", syncViewportMetrics);
 
     return () => {
       document.removeEventListener("contextmenu", prevent);
       document.removeEventListener("selectstart", prevent);
-      window.removeEventListener("resize", onResize);
+      window.removeEventListener("resize", syncViewportMetrics);
+      window.removeEventListener("orientationchange", syncViewportMetrics);
+      window.visualViewport?.removeEventListener("resize", syncViewportMetrics);
+      document.removeEventListener("fullscreenchange", syncViewportMetrics);
+      document.removeEventListener("webkitfullscreenchange", syncViewportMetrics);
+      if (fsHintTimerRef.current) window.clearTimeout(fsHintTimerRef.current);
     };
   }, []);
 
@@ -105,49 +278,96 @@ export default function PhoneControllerApp() {
   }, []);
 
   useEffect(() => {
-    const socket = io(getSocketUrl(), { transports: ["websocket", "polling"] });
-    socketRef.current = socket;
+    const cleanupSocket = connectRelaySocket({
+      role: "controller",
+      pairToken,
+      onStatusChange: (statusInfo) => {
+        setRelayStatus(statusInfo?.status || "connecting");
+        if (statusInfo?.status !== "connected") {
+          setConnected(false);
+        }
+      },
+      onSocket: (socket) => {
+        socketRef.current = socket;
 
-    socket.on("connect", () => {
-      setConnected(true);
-      socket.emit("controller:action", "syncState");
-    });
-    socket.on("disconnect", () => setConnected(false));
-    socket.on("game:telemetry", (data) => {
-      if (!data) return;
-      setTelemetry((prev) => ({
-        ...prev,
-        ...data,
-        playerMode: data.playerMode || prev.playerMode,
-      }));
-    });
-    socket.on("game:haptic", (pattern) => {
-      if (typeof navigator !== "undefined" && navigator.vibrate) {
-        navigator.vibrate(pattern);
-      }
+        socket.on("connect", () => {
+          setConnected(true);
+          socket.emit("controller:action", "syncState");
+          socket.emit("controller:input", inputRef.current);
+        });
+        socket.on("disconnect", () => {
+          setConnected(false);
+          setPairStatus((prev) => ({ ...prev, linked: false }));
+        });
+        socket.on("controller:pair-status", (status) => {
+          if (!status || typeof status !== "object") return;
+          if (status.pairToken && status.pairToken !== pairToken) {
+            setPairToken(status.pairToken);
+            setPairDraft(status.pairToken);
+          }
+          setPairStatus({
+            linked: Boolean(status.linked),
+            activeGames: Number(status.activeGames) || 0,
+            availablePairs: Array.isArray(status.availablePairs)
+              ? status.availablePairs
+              : [],
+          });
+        });
+        socket.on("game:telemetry", (data) => {
+          if (!data) return;
+          setPairStatus((prev) => (prev.linked ? prev : { ...prev, linked: true }));
+          setTelemetry((prev) => ({
+            ...prev,
+            ...data,
+            playerMode: data.playerMode || prev.playerMode,
+          }));
+        });
+        socket.on("game:haptic", (pattern) => {
+          if (typeof navigator !== "undefined" && navigator.vibrate) {
+            navigator.vibrate(pattern);
+          }
+        });
+      },
+      onCleanupSocket: (oldSocket) => {
+        if (socketRef.current === oldSocket) {
+          socketRef.current = null;
+        }
+      },
     });
 
     const heartbeat = setInterval(() => {
-      if (socket.connected) {
-        socket.emit("controller:input", inputRef.current);
+      if (socketRef.current?.connected) {
+        // Strip transient delta impulses from steady-state heartbeat
+        const { lookDeltaX, lookDeltaY, ...steadyState } = inputRef.current;
+        socketRef.current.emit("controller:input", steadyState);
       }
     }, 30);
 
     return () => {
       clearInterval(heartbeat);
-      socket.disconnect();
+      cleanupSocket();
+      socketRef.current = null;
+      setConnected(false);
     };
-  }, []);
+  }, [pairToken]);
 
+  // Automatically clear stale inputs when switching between Car HUD and Character HUD
   // Automatically clear stale inputs when switching between Car HUD and Character HUD
   useEffect(() => {
     if (telemetry.playerMode === "driving") {
       setAutoRun(false);
+      setAimActive(false);
+      setCrouchActive(false);
+      setFiringActive(false);
+      setEmotesOpen(false);
+      setBagOpen(false);
       inputRef.current.autoRun = false;
       inputRef.current.moveX = 0;
       inputRef.current.moveY = 0;
       inputRef.current.sprint = false;
       inputRef.current.crouch = false;
+      inputRef.current.fire = false;
+      inputRef.current.aim = false;
       setJoyKnob({ x: 0, y: 0, active: false });
     } else if (telemetry.playerMode === "onFoot") {
       inputRef.current.accelerate = false;
@@ -155,9 +375,40 @@ export default function PhoneControllerApp() {
       inputRef.current.handbrake = false;
       inputRef.current.boost = false;
       inputRef.current.steer = 0;
+      wheelTouchIdRef.current = null;
+      wheelMouseDownRef.current = false;
+      setWheelGrabbed(false);
       setSteerVal(0);
     }
   }, [telemetry.playerMode]);
+
+  useEffect(() => {
+    if (
+      telemetry.matchStatus === "DROPPING" &&
+      prevMatchStatusRef.current !== "DROPPING"
+    ) {
+      setAutoRun(false);
+      setAimActive(false);
+      setCrouchActive(false);
+      setFiringActive(false);
+      setEmotesOpen(false);
+      setBagOpen(false);
+      inputRef.current.autoRun = false;
+      inputRef.current.crouch = false;
+      inputRef.current.aim = false;
+      inputRef.current.fire = false;
+      inputRef.current.jump = false;
+      emitInput();
+    }
+    prevMatchStatusRef.current = telemetry.matchStatus;
+  }, [telemetry.matchStatus, emitInput]);
+
+  const medkitTimerRef = useRef(null);
+  useEffect(() => {
+    return () => {
+      if (medkitTimerRef.current) window.clearTimeout(medkitTimerRef.current);
+    };
+  }, []);
 
   const updateField = useCallback(
     (key, value) => {
@@ -211,18 +462,11 @@ export default function PhoneControllerApp() {
     [isPortraitViewport],
   );
 
-  const handleMoveJoyUpdate = useCallback(
-    (e) => {
-      if (e.cancelable) e.preventDefault();
-      e.stopPropagation();
+  const applyJoyPoint = useCallback(
+    (pt) => {
       const el = joyBoxRef.current;
-      if (!el) return;
-      const pt = e.targetTouches?.[0] || e.touches?.[0] || e;
-      const { dx, dy, normX, normY } = mapTouchDelta(
-        el,
-        pt.clientX,
-        pt.clientY,
-      );
+      if (!el || !pt) return;
+      const { dx, dy, normX, normY } = mapTouchDelta(el, pt.clientX, pt.clientY);
       inputRef.current.moveX = normX;
       inputRef.current.moveY = normY;
 
@@ -238,9 +482,60 @@ export default function PhoneControllerApp() {
     [mapTouchDelta, emitInput],
   );
 
+  const handleMoveJoyStart = useCallback(
+    (e) => {
+      e.stopPropagation();
+      if (e.changedTouches) {
+        if (joyTouchIdRef.current !== null) return;
+        const pt = e.changedTouches[0];
+        if (!pt) return;
+        joyTouchIdRef.current = pt.identifier;
+        applyJoyPoint(pt);
+        return;
+      }
+      if (e.cancelable) e.preventDefault();
+      if (joyTouchIdRef.current !== null) return;
+      joyMouseDownRef.current = true;
+      applyJoyPoint(e);
+    },
+    [applyJoyPoint],
+  );
+
+  const handleMoveJoyMove = useCallback(
+    (e) => {
+      e.stopPropagation();
+      if (e.touches || e.changedTouches) {
+        if (joyTouchIdRef.current === null) return;
+        const pt =
+          findTouchById(e.touches, joyTouchIdRef.current) ||
+          findTouchById(e.changedTouches, joyTouchIdRef.current);
+        if (!pt) return;
+        applyJoyPoint(pt);
+        return;
+      }
+      if (!joyMouseDownRef.current || e.buttons !== 1) return;
+      if (e.cancelable) e.preventDefault();
+      applyJoyPoint(e);
+    },
+    [applyJoyPoint],
+  );
+
   const handleMoveJoyEnd = useCallback(
     (e) => {
-      if (e && e.cancelable) e.preventDefault();
+      e?.stopPropagation?.();
+      if (e?.changedTouches) {
+        if (joyTouchIdRef.current === null) return;
+        const ended = findTouchById(e.changedTouches, joyTouchIdRef.current);
+        const stillDown = findTouchById(e.touches, joyTouchIdRef.current);
+        if (!ended && stillDown) return;
+        if (e.cancelable) e.preventDefault();
+        joyTouchIdRef.current = null;
+      } else {
+        if (!joyMouseDownRef.current) return;
+        if (e?.cancelable) e.preventDefault();
+        joyMouseDownRef.current = false;
+      }
+
       inputRef.current.moveX = 0;
       inputRef.current.moveY = 0;
       setJoyKnob({ x: 0, y: 0, active: false });
@@ -262,9 +557,28 @@ export default function PhoneControllerApp() {
 
   const handleSwipeStart = useCallback(
     (e) => {
-      if (e.cancelable) e.preventDefault();
+      if (
+        e.target?.closest?.(
+          "button, [role='button'], .ffh-interactive, .mc-ff-joy-hit, .mc-modal-backdrop",
+        )
+      ) {
+        return;
+      }
       e.stopPropagation();
-      const pt = e.targetTouches?.[0] || e.touches?.[0] || e;
+
+      let pt = null;
+      if (e.changedTouches) {
+        if (swipeTouchIdRef.current !== null) return;
+        pt = e.changedTouches[0];
+        if (!pt) return;
+        swipeTouchIdRef.current = pt.identifier;
+      } else {
+        if (e.cancelable) e.preventDefault();
+        if (swipeTouchIdRef.current !== null) return;
+        swipeMouseDownRef.current = true;
+        pt = e;
+      }
+
       const pos = extractLandscapeXY(pt);
       prevSwipePtRef.current = { x: pos.x, y: pos.y, startX: pos.x };
       setSwipeIndicator({ active: true, offset: 0 });
@@ -275,9 +589,20 @@ export default function PhoneControllerApp() {
   const handleSwipeMove = useCallback(
     (e) => {
       if (!prevSwipePtRef.current) return;
-      if (e.cancelable) e.preventDefault();
+      let pt = null;
+      if (e.touches || e.changedTouches) {
+        if (swipeTouchIdRef.current === null) return;
+        pt =
+          findTouchById(e.touches, swipeTouchIdRef.current) ||
+          findTouchById(e.changedTouches, swipeTouchIdRef.current);
+        if (!pt) return;
+      } else {
+        if (!swipeMouseDownRef.current || e.buttons !== 1) return;
+        if (e.cancelable) e.preventDefault();
+        pt = e;
+      }
+
       e.stopPropagation();
-      const pt = e.targetTouches?.[0] || e.touches?.[0] || e;
       const pos = extractLandscapeXY(pt);
 
       const deltaX = pos.x - prevSwipePtRef.current.x;
@@ -293,18 +618,32 @@ export default function PhoneControllerApp() {
       setSwipeIndicator({ active: true, offset: visualOffset });
 
       emitInput({
-        lookDeltaX: deltaX * 0.012,
-        lookDeltaY: deltaY * 0.006,
+        lookDeltaX: deltaX * 0.014,
+        lookDeltaY: deltaY * 0.008,
       });
     },
     [extractLandscapeXY, emitInput],
   );
 
   const handleSwipeEnd = useCallback((e) => {
-    if (e && e.cancelable) e.preventDefault();
+    e?.stopPropagation?.();
+    if (e?.changedTouches) {
+      if (swipeTouchIdRef.current === null) return;
+      const ended = findTouchById(e.changedTouches, swipeTouchIdRef.current);
+      const stillDown = findTouchById(e.touches, swipeTouchIdRef.current);
+      if (!ended && stillDown) return;
+      if (e.cancelable) e.preventDefault();
+      swipeTouchIdRef.current = null;
+    } else {
+      if (!swipeMouseDownRef.current) return;
+      if (e?.cancelable) e.preventDefault();
+      swipeMouseDownRef.current = false;
+    }
+
     prevSwipePtRef.current = null;
     setSwipeIndicator({ active: false, offset: 0 });
-  }, []);
+    emitInput({ lookDeltaX: 0, lookDeltaY: 0 });
+  }, [emitInput]);
 
   const openGyroPrompt = useCallback(() => {
     setSteerMode("tilt");
@@ -426,9 +765,19 @@ export default function PhoneControllerApp() {
 
   const handleWheelStart = useCallback(
     (e) => {
-      if (e.cancelable) e.preventDefault();
       e.stopPropagation();
-      const pt = e.targetTouches?.[0] || e.touches?.[0] || e;
+      let pt = null;
+      if (e.changedTouches) {
+        if (wheelTouchIdRef.current !== null) return;
+        pt = e.changedTouches[0];
+        if (!pt) return;
+        wheelTouchIdRef.current = pt.identifier;
+      } else {
+        if (e.cancelable) e.preventDefault();
+        if (wheelTouchIdRef.current !== null) return;
+        wheelMouseDownRef.current = true;
+        pt = e;
+      }
       prevFingerAngleRef.current = getFingerPolarAngle(pt);
       setWheelGrabbed(true);
     },
@@ -438,10 +787,21 @@ export default function PhoneControllerApp() {
   const handleWheelMove = useCallback(
     (e) => {
       if (prevFingerAngleRef.current === null) return;
-      if (e.cancelable) e.preventDefault();
+      let pt = null;
+      if (e.touches || e.changedTouches) {
+        if (wheelTouchIdRef.current === null) return;
+        pt =
+          findTouchById(e.touches, wheelTouchIdRef.current) ||
+          findTouchById(e.changedTouches, wheelTouchIdRef.current);
+        if (!pt) return;
+      } else {
+        if (!wheelMouseDownRef.current || e.buttons !== 1) return;
+        if (e.cancelable) e.preventDefault();
+        pt = e;
+      }
+
       e.stopPropagation();
 
-      const pt = e.targetTouches?.[0] || e.touches?.[0] || e;
       const currentFingerAngle = getFingerPolarAngle(pt);
 
       let deltaDeg = currentFingerAngle - prevFingerAngleRef.current;
@@ -470,7 +830,20 @@ export default function PhoneControllerApp() {
 
   const handleWheelEnd = useCallback(
     (e) => {
-      if (e && e.cancelable) e.preventDefault();
+      e?.stopPropagation?.();
+      if (e?.changedTouches) {
+        if (wheelTouchIdRef.current === null) return;
+        const ended = findTouchById(e.changedTouches, wheelTouchIdRef.current);
+        const stillDown = findTouchById(e.touches, wheelTouchIdRef.current);
+        if (!ended && stillDown) return;
+        if (e.cancelable) e.preventDefault();
+        wheelTouchIdRef.current = null;
+      } else {
+        if (!wheelMouseDownRef.current) return;
+        if (e?.cancelable) e.preventDefault();
+        wheelMouseDownRef.current = false;
+      }
+
       prevFingerAngleRef.current = null;
       wheelAngleDegRef.current = 0;
       setWheelGrabbed(false);
@@ -481,17 +854,82 @@ export default function PhoneControllerApp() {
     [emitInput],
   );
 
-  const toggleFullscreen = useCallback(() => {
-    const docEl = document.documentElement;
-    if (!document.fullscreenElement && docEl.requestFullscreen) {
-      docEl.requestFullscreen().catch(() => {});
-      if (window.screen?.orientation?.lock) {
-        window.screen.orientation.lock("landscape").catch(() => {});
-      }
-    } else if (document.exitFullscreen) {
-      document.exitFullscreen().catch(() => {});
-    }
+  const showFsHint = useCallback((msg) => {
+    setFsHint(msg);
+    if (fsHintTimerRef.current) window.clearTimeout(fsHintTimerRef.current);
+    fsHintTimerRef.current = window.setTimeout(() => {
+      fsHintTimerRef.current = null;
+      setFsHint("");
+    }, 4500);
   }, []);
+
+  const toggleFullscreen = useCallback(async () => {
+    const docEl = document.documentElement;
+    if (typeof window !== "undefined") {
+      window.scrollTo(0, 1);
+    }
+    const activeFs =
+      document.fullscreenElement ||
+      document.webkitFullscreenElement ||
+      document.mozFullScreenElement ||
+      document.msFullscreenElement;
+
+    if (!activeFs) {
+      const reqFs =
+        docEl.requestFullscreen ||
+        docEl.webkitRequestFullscreen ||
+        docEl.webkitRequestFullScreen ||
+        docEl.mozRequestFullScreen ||
+        docEl.msRequestFullscreen;
+
+      if (!reqFs) {
+        try {
+          await window.screen?.orientation?.lock?.("landscape");
+        } catch {
+          // Orientation lock unavailable outside fullscreen on some browsers
+        }
+        showFsHint(
+          "On iPhone/Safari: rotate sideways or tap Share -> Add to Home Screen for full screen.",
+        );
+        return;
+      }
+
+      try {
+        let res;
+        try {
+          res = reqFs.call(docEl, { navigationUI: "hide" });
+        } catch {
+          res = reqFs.call(docEl);
+        }
+        if (res && typeof res.then === "function") {
+          await res;
+        }
+        try {
+          await window.screen?.orientation?.lock?.("landscape");
+        } catch {
+          // Ignore if device orientation lock is disallowed
+        }
+      } catch {
+        showFsHint(
+          "Browser blocked fullscreen — rotate phone sideways or add page to Home Screen.",
+        );
+      }
+      return;
+    }
+
+    const exitFs =
+      document.exitFullscreen ||
+      document.webkitExitFullscreen ||
+      document.mozCancelFullScreen ||
+      document.msExitFullscreen;
+    if (exitFs) {
+      try {
+        await exitFs.call(document);
+      } catch {
+        // Ignore fullscreen exit rejection
+      }
+    }
+  }, [showFsHint]);
 
   const handleSteerSideChange = useCallback((side) => {
     setSteerSide(side);
@@ -503,11 +941,47 @@ export default function PhoneControllerApp() {
     socketRef.current?.emit("controller:settings", { scenePreset: presetKey });
   }, []);
 
+  const emitAction = useCallback((action) => {
+    socketRef.current?.emit("controller:action", action);
+  }, []);
+
+  const handleMobileHeal = useCallback(() => {
+    if ((telemetry.medkits ?? 0) <= 0 || telemetry.hp >= 100 || medkitHealing) {
+      return;
+    }
+    setMedkitHealing(true);
+    if (medkitTimerRef.current) window.clearTimeout(medkitTimerRef.current);
+    medkitTimerRef.current = window.setTimeout(() => {
+      medkitTimerRef.current = null;
+      emitAction("heal");
+      setMedkitHealing(false);
+    }, 900);
+  }, [telemetry.medkits, telemetry.hp, medkitHealing, emitAction]);
+
+  const handleToggleAim = useCallback(() => {
+    setAimActive((prev) => {
+      const next = !prev;
+      updateField("aim", next);
+      return next;
+    });
+  }, [updateField]);
+
+  const handleToggleCrouch = useCallback(() => {
+    setCrouchActive((prev) => {
+      const next = !prev;
+      updateField("crouch", next);
+      return next;
+    });
+  }, [updateField]);
+
   const isOnFoot =
     telemetry.playerMode === "onFoot" || telemetry.playerMode === "exiting";
   const rpmRatio = Math.min(1, (telemetry.rpm || 850) / 7500);
   const ledCount = 14;
   const activeLeds = Math.round(rpmRatio * ledCount);
+  const headingDeg = telemetry.headingDeg || 0;
+  const cardinal = getCardinalFromDeg(headingDeg);
+  const activeWeaponId = telemetry.weaponId || "m4a1";
 
   return (
     <div
@@ -515,283 +989,729 @@ export default function PhoneControllerApp() {
         isPortraitViewport ? "mc-viewport mc-force-landscape" : "mc-viewport"
       }
     >
-      <div className="mc-rpm-strip">
-        {Array.from({ length: ledCount }).map((_, idx) => {
-          const isOn = idx < activeLeds;
-          const tier = idx < 6 ? "green" : idx < 10 ? "blue" : "red";
-          return (
-            <span
-              key={idx}
-              className={`mc-shift-led ${isOn ? `on ${tier}` : ""}`}
-            />
-          );
-        })}
-      </div>
+      {isOnFoot ? (
+        <div className="mc-ff-stage ff-hud-root">
+          {/* Dedicated 360° Aim Swipe Surface behind HUD clusters */}
+          <div
+            ref={swipeBoxRef}
+            className="mc-ff-aim-backdrop"
+            style={{ pointerEvents: customHudEditing ? "none" : "auto" }}
+            onTouchStart={customHudEditing ? undefined : handleSwipeStart}
+            onTouchMove={customHudEditing ? undefined : handleSwipeMove}
+            onTouchEnd={customHudEditing ? undefined : handleSwipeEnd}
+            onTouchCancel={customHudEditing ? undefined : handleSwipeEnd}
+            onMouseDown={customHudEditing ? undefined : handleSwipeStart}
+            onMouseMove={customHudEditing ? undefined : handleSwipeMove}
+            onMouseUp={customHudEditing ? undefined : handleSwipeEnd}
+            onMouseLeave={customHudEditing ? undefined : handleSwipeEnd}
+          >
+            <div
+              className={`ffh-crosshair ${aimActive ? "aiming" : ""} ${firingActive ? "firing" : ""}`}
+            >
+              <div className="ffh-reticle-tick top" />
+              <div className="ffh-reticle-tick right" />
+              <div className="ffh-reticle-tick bottom" />
+              <div className="ffh-reticle-tick left" />
+              <div className="ffh-reticle-dot" />
+            </div>
+            {swipeIndicator.active && (
+              <div className="mc-ff-swipe-hint active">
+                <span>AIMING</span>
+                <span
+                  className="mc-ff-swipe-indicator"
+                  style={{
+                    transform: `translateX(${Math.round(swipeIndicator.offset * 0.45)}px)`,
+                  }}
+                />
+              </div>
+            )}
+          </div>
 
-      <header className="mc-header">
-        <div className="mc-brand-status">
-          <div className="mc-m-badge">M</div>
-          <div>
-            <div className="mc-conn-row">
+          {(telemetry.statusMsg ||
+            !connected ||
+            !pairStatus.linked ||
+            telemetry.inLobby) && (
+            <div
+              className="mc-ff-status-toast ffh-interactive"
+              style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", justifyContent: "center" }}
+            >
+              <span>
+                {!connected
+                  ? relayStatus === "offline"
+                    ? "RELAY SERVER OFFLINE — START SERVER & KEEP LAPTOP ON SAME WI-FI"
+                    : "CONNECTING TO LAPTOP..."
+                  : !pairStatus.linked
+                    ? pairStatus.activeGames > 0
+                      ? "UNPAIRED SESSION — TAP LINK TO CONNECT TO ACTIVE LAPTOP OR SCAN QR"
+                      : "WAITING FOR LAPTOP GAME CLIENT TO OPEN"
+                    : telemetry.statusMsg
+                      ? telemetry.statusMsg
+                      : "LAPTOP IS IN LOBBY — TAP QUICK SOLO OR START MATCH ON LAPTOP"}
+              </span>
+              {connected &&
+                !pairStatus.linked &&
+                pairStatus.availablePairs.length > 0 && (
+                  <TapButton
+                    className="ffh-mini-circle-btn"
+                    style={{
+                      width: "auto",
+                      height: "24px",
+                      padding: "0 10px",
+                      borderRadius: "6px",
+                      background: "#f97316",
+                      color: "#0b0f19",
+                      fontSize: "10px",
+                      fontWeight: 900,
+                    }}
+                    onTrigger={() => {
+                      const next = pairStatus.availablePairs[0];
+                      setPairDraft(next);
+                      setPairToken(next);
+                    }}
+                  >
+                    LINK GAME
+                  </TapButton>
+                )}
+            </div>
+          )}
+
+          {/* 1. TOP-LEFT: SQUARE RADAR + 1 YOU + COMMS / TOOL CIRCLES */}
+          <div className="ffh-tl-cluster">
+            <FreeFireMinimapBox
+              posX={telemetry.posX || 0}
+              posZ={telemetry.posZ || 0}
+              headingDeg={headingDeg}
+              matchElapsed={telemetry.matchElapsed || 0}
+              enemies={telemetry.enemies || []}
+              carPos={telemetry.carPos || null}
+            />
+
+            <div className="ffh-tl-tools ffh-interactive">
+              <div className="ffh-tl-tool-row">
+                <TapButton
+                  className={`ffh-mini-circle-btn ${speakerMuted ? "muted" : ""}`}
+                  onTrigger={() => setSpeakerMuted((v) => !v)}
+                  title="Toggle Team Audio"
+                >
+                  <SpeakerSvg muted={speakerMuted} />
+                </TapButton>
+                <TapButton
+                  className={`ffh-mini-circle-btn ${micMuted ? "muted" : ""}`}
+                  onTrigger={() => setMicMuted((v) => !v)}
+                  title="Toggle Microphone"
+                >
+                  <MicSvg muted={micMuted} />
+                </TapButton>
+                <span className="ffh-eye-badge" title="Spectators">
+                  <EyeSvg />
+                  <span>1</span>
+                </span>
+                <span
+                  className={`ffh-signal-badge ${connected && pairStatus.linked ? "online" : "offline"}`}
+                  title={`Paired Session: ${pairToken}`}
+                >
+                  <span
+                    className={
+                      connected && pairStatus.linked
+                        ? "mc-dot mc-dot-live"
+                        : "mc-dot mc-dot-wait"
+                    }
+                  />
+                  {!connected
+                    ? relayStatus === "offline"
+                      ? "OFFLINE"
+                      : "WAIT"
+                    : pairStatus.linked
+                      ? "SYNC"
+                      : "UNPAIRED"}
+                </span>
+              </div>
+
+              <div className="ffh-tl-tool-row">
+                <TapButton
+                  className={`ffh-mini-circle-btn ${autoRun ? "active" : ""}`}
+                  onTrigger={toggleAutoRun}
+                  title="Auto-Run / Sprint"
+                >
+                  <SprintSvg />
+                </TapButton>
+                <TapButton
+                  className="ffh-mini-circle-btn"
+                  onTrigger={() => emitAction("camera")}
+                  title="Switch Camera"
+                >
+                  <Icons.Camera />
+                </TapButton>
+                <TapButton
+                  className="ffh-mini-circle-btn"
+                  onTrigger={() => emitAction("reset")}
+                  title="Reset Car"
+                >
+                  <Icons.Reset />
+                </TapButton>
+                <TapButton
+                  className={`ffh-fullscreen-pill ${isFullscreen ? "active" : ""}`}
+                  onTrigger={toggleFullscreen}
+                  title="Toggle Fullscreen Landscape"
+                >
+                  <Icons.Fullscreen />
+                  <span>{isFullscreen ? "EXIT" : "FULL"}</span>
+                </TapButton>
+                <TapButton
+                  className={`ffh-mini-circle-btn ${customHudEditing ? "active" : ""}`}
+                  onTrigger={() => setCustomHudEditing((v) => !v)}
+                  title="Customize HUD (Size, Transparency & Position)"
+                  data-testid="phone-custom-hud-btn"
+                >
+                  <HudLayoutSvg />
+                </TapButton>
+              </div>
+            </div>
+          </div>
+
+          {/* 2. TOP-CENTER: HELMET/VEST + EP/HP + FF 500 + SAFE ZONE + KILL FEED */}
+          <FreeFireTopCenterCluster
+            helmetLevel={telemetry.helmetLevel ?? 3}
+            vestLevel={telemetry.vestLevel ?? 3}
+            ep={telemetry.ep ?? 180}
+            playerHp={telemetry.hp ?? 100}
+            cardinal={cardinal}
+            headingDeg={headingDeg}
+            matchElapsed={telemetry.matchElapsed || 0}
+            killFeed={telemetry.killFeed || []}
+          />
+
+          {/* 3. TOP-RIGHT: TEAL ALIVE + CRIMSON KILLS + GEAR + WEAPON CARDS */}
+          <FreeFireTopRightCluster
+            aliveCount={telemetry.aliveCount ?? 7}
+            kills={telemetry.kills ?? 0}
+            onOpenSettings={() => setSettingsOpen(true)}
+            showWeaponCards={true}
+            showWeaponChips={false}
+            weaponId={activeWeaponId}
+            ammoState={telemetry.ammoState || DEFAULT_AMMO_STATE}
+            reloading={Boolean(telemetry.reloading)}
+            primaryWeapon={telemetry.primaryWeapon || "m4a1"}
+            secondaryWeapon={telemetry.secondaryWeapon || "deagle"}
+            onSwitchWeapon={() => emitAction("switchWeapon")}
+            onReloadWeapon={() => emitAction("reloadWeapon")}
+            onSelectWeapon={(id) => emitAction(`selectWeapon:${id}`)}
+          />
+
+          {/* 4. AIRCRAFT EJECT / VICTORY / DEFEAT BANNER */}
+          {(telemetry.matchStatus === "DROPPING" || customHudEditing) && (
+            <CustomHudElement
+              id="dropParachute"
+              editMode={customHudEditing}
+              selected={selectedHudElem === "dropParachute"}
+              cfg={hudLayout.dropParachute}
+              onSelect={setSelectedHudElem}
+              onMove={handleMoveLayout}
+            >
+              <div className="ffh-drop-banner mc-ff-drop-banner ffh-interactive">
+                {telemetry.aircraftPhase === "flying" || customHudEditing ? (
+                  <TapButton
+                    className="ffh-eject-btn"
+                    onTrigger={() => emitAction("ejectAircraft")}
+                  >
+                    EJECT PARACHUTE
+                  </TapButton>
+                ) : (
+                  <div className="ffh-parachute-chip">
+                    PARACHUTE DEPLOYED · STEER WITH JOYSTICK
+                  </div>
+                )}
+              </div>
+            </CustomHudElement>
+          )}
+
+          {(telemetry.matchStatus === "VICTORY" ||
+            telemetry.matchStatus === "DEFEAT") && (
+            <div className="mc-ff-result-banner ffh-interactive">
               <span
                 className={
-                  connected ? "mc-dot mc-dot-live" : "mc-dot mc-dot-wait"
+                  telemetry.matchStatus === "VICTORY"
+                    ? "mc-ff-result-title booyah"
+                    : "mc-ff-result-title eliminated"
                 }
-              />
-              <span className="mc-conn-text">
-                {connected ? "M-LINK ACTIVE" : "CONNECTING..."}
+              >
+                {telemetry.matchStatus === "VICTORY"
+                  ? "BOOYAH! VICTORY"
+                  : "ELIMINATED"}
               </span>
+              <TapButton
+                className="ffh-eject-btn mc-ff-play-again"
+                onTrigger={() => emitAction("playAgain")}
+              >
+                PLAY AGAIN
+              </TapButton>
             </div>
-            <div className="mc-sub-mode">
-              {isOnFoot
-                ? "ON FOOT · JOYSTICK + AUTO-RUN + SWIPE TURN"
-                : steerMode === "tilt"
-                  ? "GYRO TILT · L: BRAKE | R: ACCEL"
-                  : `WHEEL (${steerSide.toUpperCase()}) · CIRCULAR TOUCH`}
+          )}
+
+          {/* LOADOUT & EMOTE DRAWERS (WHEN OPEN) */}
+          {bagOpen && (
+            <div className="mc-ff-loadout-drawer ffh-interactive" style={{ zIndex: 120 }}>
+              {WEAPON_ORDER.map((id) => {
+                const slotAmmo =
+                  (telemetry.ammoState || DEFAULT_AMMO_STATE)[id] || {
+                    mag: 0,
+                    reserve: 0,
+                  };
+                const active = activeWeaponId === id;
+                return (
+                  <TapButton
+                    key={id}
+                    className={`mc-ff-loadout-item ${active ? "active" : ""}`}
+                    onTrigger={() => {
+                      emitAction(`selectWeapon:${id}`);
+                      setBagOpen(false);
+                    }}
+                  >
+                    <WeaponSilhouetteSvg
+                      weaponId={id}
+                      className="mc-ff-loadout-svg"
+                    />
+                    <span>{WEAPONS[id]?.name}</span>
+                    <small>
+                      {id === "fist"
+                        ? "∞"
+                        : `${slotAmmo.mag}/${slotAmmo.reserve}`}
+                    </small>
+                  </TapButton>
+                );
+              })}
             </div>
-          </div>
-        </div>
+          )}
 
-        <div className="mc-digital-cluster">
-          <div className="mc-speed-block">
-            <span className="mc-speed-digits">
-              {String(Math.abs(telemetry.speed || 0)).padStart(3, "0")}
-            </span>
-            <span className="mc-speed-unit">KM/H</span>
-          </div>
-          <div className="mc-cluster-divider" />
-          <div className="mc-gear-block">
-            <span className="mc-gear-label">MODE</span>
-            <span className="mc-gear-digit">
-              {isOnFoot ? (autoRun ? "RUN" : "WALK") : telemetry.gear || "N"}
-            </span>
-          </div>
-        </div>
+          {emotesOpen && (
+            <div className="mc-ff-emote-drawer ffh-interactive" style={{ zIndex: 120 }}>
+              {CONTROLLER_EMOTES.map((emote) => (
+                <TapButton
+                  key={emote.id}
+                  className="mc-ff-emote-chip"
+                  onTrigger={() => {
+                    emitAction(`emote:${emote.id}`);
+                    setEmotesOpen(false);
+                  }}
+                >
+                  {emote.label}
+                </TapButton>
+              ))}
+            </div>
+          )}
 
-        <div className="mc-icon-toolbar">
-          <button
-            type="button"
-            className="mc-icon-btn mc-action-pill"
-            onClick={() =>
-              socketRef.current?.emit("controller:action", "toggleVehicle")
-            }
-            title="Enter / Exit Car"
+          {/* 5. INDIVIDUAL CUSTOM HUD CONTROLS (FREE FIRE CUSTOM HUD) */}
+          {/* JOYSTICK */}
+          <CustomHudElement
+            id="joystick"
+            editMode={customHudEditing}
+            selected={selectedHudElem === "joystick"}
+            cfg={hudLayout.joystick}
+            onSelect={setSelectedHudElem}
+            onMove={handleMoveLayout}
           >
-            {isOnFoot ? "ENTER CAR" : "EXIT CAR"}
-          </button>
-
-          <button
-            type="button"
-            className="mc-icon-btn"
-            onClick={() =>
-              socketRef.current?.emit("controller:action", "camera")
-            }
-            title="Switch Camera"
-          >
-            <Icons.Camera />
-          </button>
-
-          <button
-            type="button"
-            className="mc-icon-btn"
-            onClick={() =>
-              socketRef.current?.emit("controller:action", "reset")
-            }
-            title="Reset Car"
-          >
-            <Icons.Reset />
-          </button>
-
-          <button
-            type="button"
-            className="mc-icon-btn"
-            onClick={toggleFullscreen}
-            title="Fullscreen Landscape"
-          >
-            <Icons.Fullscreen />
-          </button>
-
-          <button
-            type="button"
-            className="mc-icon-btn mc-settings-trigger"
-            onClick={() => setSettingsOpen(true)}
-            title="Controller Settings"
-          >
-            <Icons.Settings />
-          </button>
-        </div>
-      </header>
-
-      {isOnFoot ? (
-        <div className="mc-character-layout">
-          {/* Left Zone: Analog Joystick for Small / In-Place Movements */}
-          <div
-            ref={joyBoxRef}
-            className="mc-joy-zone"
-            onTouchStart={handleMoveJoyUpdate}
-            onTouchMove={handleMoveJoyUpdate}
-            onTouchEnd={handleMoveJoyEnd}
-            onTouchCancel={handleMoveJoyEnd}
-            onMouseDown={handleMoveJoyUpdate}
-            onMouseMove={(e) => {
-              if (e.buttons === 1) handleMoveJoyUpdate(e);
-            }}
-            onMouseUp={handleMoveJoyEnd}
-            onMouseLeave={handleMoveJoyEnd}
-          >
-            <div className="mc-joy-ring">
+            <div
+              ref={joyBoxRef}
+              className={`ffh-joystick-pad mc-ff-joy-hit ${joyKnob.active ? "active" : ""}`}
+              onTouchStart={customHudEditing ? undefined : handleMoveJoyStart}
+              onTouchMove={customHudEditing ? undefined : handleMoveJoyMove}
+              onTouchEnd={customHudEditing ? undefined : handleMoveJoyEnd}
+              onTouchCancel={customHudEditing ? undefined : handleMoveJoyEnd}
+              onMouseDown={customHudEditing ? undefined : handleMoveJoyStart}
+              onMouseMove={customHudEditing ? undefined : handleMoveJoyMove}
+              onMouseUp={customHudEditing ? undefined : handleMoveJoyEnd}
+              onMouseLeave={customHudEditing ? undefined : handleMoveJoyEnd}
+            >
               <div
-                className={
-                  joyKnob.active ? "mc-joy-knob active" : "mc-joy-knob"
-                }
+                className={`ffh-joystick-knob ${joyKnob.active ? "active" : ""}`}
                 style={{
                   transform: `translate(${joyKnob.x}px, ${joyKnob.y}px)`,
                 }}
               />
             </div>
-            <div className="mc-rotary-footer">
-              <span className="mc-rotary-hint">FINE MOVE JOYSTICK</span>
-              <span className="mc-rotary-deg">
-                {Math.round(
-                  Math.hypot(inputRef.current.moveX, inputRef.current.moveY) *
-                    100,
-                )}
-                %
-              </span>
-            </div>
-          </div>
+          </CustomHudElement>
 
-          {/* Center Zone: Continuous Auto-Run Button + Sprint, Jump, Crouch, Enter Car, Emotes */}
-          <div className="mc-char-center-actions">
-            <button
-              type="button"
-              className={
-                autoRun ? "mc-autorun-btn is-running" : "mc-autorun-btn"
-              }
-              onClick={toggleAutoRun}
-            >
-              <span className="mc-autorun-dot" />
-              <div className="mc-autorun-text">
-                <span className="mc-autorun-title">
-                  {autoRun
-                    ? "RUNNING STRAIGHT (TAP TO STOP)"
-                    : "RUN CONTINUOUSLY"}
-                </span>
-                <span className="mc-autorun-sub">
-                  SWIPE RIGHT PAD HORIZONTALLY TO STEER DIRECTION
-                </span>
-              </div>
-            </button>
-
-            <div className="mc-char-primary-grid">
-              <HoldButton
-                className="mc-aux-btn mc-boost-btn"
-                activeClassName="is-pressed"
-                onChange={(v) => updateField("sprint", v)}
-              >
-                <span className="mc-aux-label">SPRINT</span>
-              </HoldButton>
-
-              <HoldButton
-                className="mc-aux-btn mc-drift-btn"
-                activeClassName="is-pressed"
-                onChange={(v) => updateField("jump", v)}
-              >
-                <span className="mc-aux-label">JUMP ↑</span>
-              </HoldButton>
-
-              <HoldButton
-                className="mc-aux-btn mc-crouch-btn"
-                activeClassName="is-pressed"
-                onChange={(v) => updateField("crouch", v)}
-              >
-                <span className="mc-aux-label">CROUCH</span>
-              </HoldButton>
-
-              <button
-                type="button"
-                className={`mc-aux-btn mc-enter-car-btn ${telemetry.nearCar ? "ready" : ""}`}
-                onClick={() =>
-                  socketRef.current?.emit("controller:action", "toggleVehicle")
-                }
-              >
-                <span className="mc-aux-label">ENTER BMW</span>
-              </button>
-            </div>
-
-            <div className="mc-char-emote-row">
-              {CONTROLLER_EMOTES.map((emote) => (
-                <button
-                  key={emote.id}
-                  type="button"
-                  className="mc-mini-emote-btn"
-                  onClick={() =>
-                    socketRef.current?.emit(
-                      "controller:action",
-                      `emote:${emote.id}`,
-                    )
-                  }
-                >
-                  {emote.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Right Zone: Horizontal Swipe Trackpad for Turning Direction */}
-          <div
-            ref={swipeBoxRef}
-            className="mc-swipe-turn-zone"
-            onTouchStart={handleSwipeStart}
-            onTouchMove={handleSwipeMove}
-            onTouchEnd={handleSwipeEnd}
-            onTouchCancel={handleSwipeEnd}
-            onMouseDown={handleSwipeStart}
-            onMouseMove={(e) => {
-              if (e.buttons === 1) handleSwipeMove(e);
-            }}
-            onMouseUp={handleSwipeEnd}
-            onMouseLeave={handleSwipeEnd}
+          {/* LEFT FIRE */}
+          <CustomHudElement
+            id="leftFire"
+            editMode={customHudEditing}
+            selected={selectedHudElem === "leftFire"}
+            cfg={hudLayout.leftFire}
+            onSelect={setSelectedHudElem}
+            onMove={handleMoveLayout}
           >
-            <div className="mc-swipe-header">SWIPE HORIZONTALLY TO TURN</div>
+            <HoldButton
+              className="ffh-action-circle static-pos"
+              activeClassName="active"
+              onChange={(v) => {
+                if (customHudEditing) return;
+                setFiringActive(v);
+                updateField("fire", v);
+              }}
+            >
+              <FireBulletSvg />
+            </HoldButton>
+          </CustomHudElement>
 
-            <div className="mc-swipe-track">
-              <span className="mc-swipe-arrow">‹‹ LEFT</span>
-              <div
-                className={
-                  swipeIndicator.active
-                    ? "mc-swipe-puck active"
-                    : "mc-swipe-puck"
-                }
-                style={{
-                  transform: `translateX(${swipeIndicator.offset}px)`,
-                }}
-              />
-              <span className="mc-swipe-arrow">RIGHT ››</span>
-            </div>
+          {/* QUICK WEAPON SWITCH */}
+          <CustomHudElement
+            id="switchWeapon"
+            editMode={customHudEditing}
+            selected={selectedHudElem === "switchWeapon"}
+            cfg={hudLayout.switchWeapon}
+            onSelect={setSelectedHudElem}
+            onMove={handleMoveLayout}
+          >
+            <TapButton
+              className="ffh-action-circle static-pos"
+              onTrigger={() => {
+                if (customHudEditing) return;
+                emitAction("switchWeapon");
+              }}
+              title="Cycle Weapon"
+            >
+              <ReloadSvg />
+              <span className="ffh-key-hint">Q</span>
+            </TapButton>
+          </CustomHudElement>
 
-            <div className="mc-rotary-footer">
-              <span className="mc-rotary-hint">DIRECTION TRACKPAD</span>
-              <span className="mc-rotary-deg">360° TURN</span>
-            </div>
-          </div>
+          {/* MEDKIT */}
+          <CustomHudElement
+            id="medkit"
+            editMode={customHudEditing}
+            selected={selectedHudElem === "medkit"}
+            cfg={hudLayout.medkit}
+            onSelect={setSelectedHudElem}
+            onMove={handleMoveLayout}
+          >
+            <TapButton
+              className={`ffh-utility-circle ${medkitHealing ? "healing" : ""}`}
+              onTrigger={() => {
+                if (customHudEditing) return;
+                handleMobileHeal();
+              }}
+              disabled={
+                !customHudEditing &&
+                ((telemetry.medkits ?? 0) <= 0 ||
+                  telemetry.hp >= 100 ||
+                  medkitHealing)
+              }
+              title="Use Medkit"
+            >
+              <MedkitSvg />
+              <span className="ffh-count-badge">{telemetry.medkits ?? 0}</span>
+            </TapButton>
+          </CustomHudElement>
+
+          {/* BACKPACK */}
+          <CustomHudElement
+            id="backpack"
+            editMode={customHudEditing}
+            selected={selectedHudElem === "backpack"}
+            cfg={hudLayout.backpack}
+            onSelect={setSelectedHudElem}
+            onMove={handleMoveLayout}
+          >
+            <TapButton
+              className={`ffh-utility-circle ${bagOpen ? "healing" : ""}`}
+              onTrigger={() => {
+                if (customHudEditing) return;
+                setBagOpen((v) => !v);
+                setEmotesOpen(false);
+              }}
+              title="Backpack / Weapon Loadout"
+            >
+              <BackpackSvg />
+            </TapButton>
+          </CustomHudElement>
+
+          {/* EMOTES */}
+          <CustomHudElement
+            id="emotes"
+            editMode={customHudEditing}
+            selected={selectedHudElem === "emotes"}
+            cfg={hudLayout.emotes}
+            onSelect={setSelectedHudElem}
+            onMove={handleMoveLayout}
+          >
+            <TapButton
+              className={`ffh-utility-circle ${emotesOpen ? "healing" : ""}`}
+              onTrigger={() => {
+                if (customHudEditing) return;
+                setEmotesOpen((v) => !v);
+                setBagOpen(false);
+              }}
+              title="Emotes"
+            >
+              <EmoteWaveSvg />
+            </TapButton>
+          </CustomHudElement>
+
+          {/* SCOPE / ADS */}
+          <CustomHudElement
+            id="aimScope"
+            editMode={customHudEditing}
+            selected={selectedHudElem === "aimScope"}
+            cfg={hudLayout.aimScope}
+            onSelect={setSelectedHudElem}
+            onMove={handleMoveLayout}
+          >
+            <TapButton
+              className={`ffh-action-circle ffh-btn-scope ${aimActive ? "active" : ""}`}
+              onTrigger={() => {
+                if (customHudEditing) return;
+                handleToggleAim();
+              }}
+              title="Scope / ADS"
+            >
+              <ScopeSvg />
+            </TapButton>
+          </CustomHudElement>
+
+          {/* JUMP */}
+          <CustomHudElement
+            id="jump"
+            editMode={customHudEditing}
+            selected={selectedHudElem === "jump"}
+            cfg={hudLayout.jump}
+            onSelect={setSelectedHudElem}
+            onMove={handleMoveLayout}
+          >
+            <HoldButton
+              className="ffh-action-circle ffh-btn-jump"
+              activeClassName="active"
+              onChange={(v) => {
+                if (customHudEditing) return;
+                updateField("jump", v);
+              }}
+            >
+              <JumpSoldierSvg />
+            </HoldButton>
+          </CustomHudElement>
+
+          {/* PRIMARY FIRE (DRAGGABLE FIRE BUTTON) */}
+          <CustomHudElement
+            id="rightFire"
+            editMode={customHudEditing}
+            selected={selectedHudElem === "rightFire"}
+            cfg={hudLayout.rightFire}
+            onSelect={setSelectedHudElem}
+            onMove={handleMoveLayout}
+          >
+            <DraggableFireButton
+              className="ffh-action-circle ffh-btn-fire"
+              isFiring={firingActive}
+              editMode={customHudEditing}
+              onFireStart={() => {
+                if (customHudEditing) return;
+                setFiringActive(true);
+                updateField("fire", true);
+              }}
+              onFireEnd={() => {
+                setFiringActive(false);
+                updateField("fire", false);
+                updateField("dragUp", false);
+                delete inputRef.current.lookDeltaX;
+                delete inputRef.current.lookDeltaY;
+                emitInput({ lookDeltaX: 0, lookDeltaY: 0 });
+              }}
+              onFireDrag={({ dragUpActive }) => {
+                if (customHudEditing) return;
+                updateField("dragUp", dragUpActive);
+              }}
+            >
+              <FireBulletSvg />
+            </DraggableFireButton>
+          </CustomHudElement>
+
+          {/* CROUCH */}
+          <CustomHudElement
+            id="crouch"
+            editMode={customHudEditing}
+            selected={selectedHudElem === "crouch"}
+            cfg={hudLayout.crouch}
+            onSelect={setSelectedHudElem}
+            onMove={handleMoveLayout}
+          >
+            <TapButton
+              className={`ffh-action-circle ffh-btn-crouch ${crouchActive ? "active" : ""}`}
+              onTrigger={() => {
+                if (customHudEditing) return;
+                handleToggleCrouch();
+              }}
+              title="Crouch"
+            >
+              <CrouchSoldierSvg />
+            </TapButton>
+          </CustomHudElement>
+
+          {/* RELOAD */}
+          <CustomHudElement
+            id="reload"
+            editMode={customHudEditing}
+            selected={selectedHudElem === "reload"}
+            cfg={hudLayout.reload}
+            onSelect={setSelectedHudElem}
+            onMove={handleMoveLayout}
+          >
+            <TapButton
+              className="ffh-action-circle ffh-btn-reload"
+              onTrigger={() => {
+                if (customHudEditing) return;
+                emitAction("reloadWeapon");
+              }}
+              title="Reload"
+            >
+              <ReloadSvg />
+              <span className="ffh-key-hint">R</span>
+            </TapButton>
+          </CustomHudElement>
+
+          {/* DRIVE BMW */}
+          <CustomHudElement
+            id="drive"
+            editMode={customHudEditing}
+            selected={selectedHudElem === "drive"}
+            cfg={hudLayout.drive}
+            onSelect={setSelectedHudElem}
+            onMove={handleMoveLayout}
+          >
+            <TapButton
+              className={`ffh-action-circle ffh-btn-drive ${telemetry.nearCar ? "ready" : "standby"}`}
+              onTrigger={() => {
+                if (customHudEditing) return;
+                emitAction("toggleVehicle");
+              }}
+              title="Enter / Drive BMW M4"
+            >
+              <CarDriveSvg />
+              <span className="ffh-key-hint">F</span>
+            </TapButton>
+          </CustomHudElement>
+
+          {/* 6. FLOATING CUSTOM HUD TOP BAR & SLIDERS OVERLAY (ON MOBILE) */}
+          {customHudEditing && (
+            <CustomHudEditorBar
+              activePreset={activePreset}
+              selectedId={selectedHudElem}
+              layout={hudLayout}
+              onChangeLayout={handleUpdateLayout}
+              onSwitchPreset={handleSwitchPreset}
+              onResetLayout={handleResetLayout}
+              onResetSelectedElement={handleResetSelected}
+              onSaveLayout={handleSaveLayout}
+              onExitEdit={() => setCustomHudEditing(false)}
+            />
+          )}
         </div>
       ) : (
         <>
-          <button
-            type="button"
+          <div className="mc-rpm-strip">
+            {Array.from({ length: ledCount }).map((_, idx) => {
+              const isOn = idx < activeLeds;
+              const tier = idx < 6 ? "green" : idx < 10 ? "blue" : "red";
+              return (
+                <span
+                  key={idx}
+                  className={`mc-shift-led ${isOn ? `on ${tier}` : ""}`}
+                />
+              );
+            })}
+          </div>
+
+          <header className="mc-header">
+            <div className="mc-brand-status">
+              <div className="mc-m-badge">M</div>
+              <div>
+                <div className="mc-conn-row">
+                  <span
+                    className={
+                      connected ? "mc-dot mc-dot-live" : "mc-dot mc-dot-wait"
+                    }
+                  />
+                  <span className="mc-conn-text">
+                    {connected
+                      ? "M-LINK ACTIVE"
+                      : relayStatus === "offline"
+                        ? "RELAY OFFLINE"
+                        : "CONNECTING..."}
+                  </span>
+                </div>
+                <div className="mc-sub-mode">
+                  {steerMode === "tilt"
+                    ? "GYRO TILT · L: BRAKE | R: ACCEL"
+                    : `WHEEL (${steerSide.toUpperCase()}) · CIRCULAR TOUCH`}
+                </div>
+              </div>
+            </div>
+
+            <div className="mc-digital-cluster">
+              <div className="mc-speed-block">
+                <span className="mc-speed-digits">
+                  {String(Math.abs(telemetry.speed || 0)).padStart(3, "0")}
+                </span>
+                <span className="mc-speed-unit">KM/H</span>
+              </div>
+              <div className="mc-cluster-divider" />
+              <div className="mc-gear-block">
+                <span className="mc-gear-label">GEAR</span>
+                <span className="mc-gear-digit">
+                  {telemetry.gear || "N"}
+                </span>
+              </div>
+            </div>
+
+            <div className="mc-icon-toolbar">
+              <TapButton
+                className="mc-icon-btn mc-action-pill"
+                onTrigger={() => emitAction("toggleVehicle")}
+                title="Exit Car"
+              >
+                EXIT CAR
+              </TapButton>
+
+              <TapButton
+                className="mc-icon-btn"
+                onTrigger={() => emitAction("camera")}
+                title="Switch Camera"
+              >
+                <Icons.Camera />
+              </TapButton>
+
+              <TapButton
+                className="mc-icon-btn"
+                onTrigger={() => emitAction("reset")}
+                title="Reset Car"
+              >
+                <Icons.Reset />
+              </TapButton>
+
+              <TapButton
+                className="mc-icon-btn"
+                onTrigger={toggleFullscreen}
+                title="Fullscreen Landscape"
+              >
+                <Icons.Fullscreen />
+              </TapButton>
+
+              <TapButton
+                className="mc-icon-btn mc-settings-trigger"
+                onTrigger={() => setSettingsOpen(true)}
+                title="Controller Settings"
+              >
+                <Icons.Settings />
+              </TapButton>
+            </div>
+          </header>
+
+          <HoldButton
             className="mc-jump-btn mc-jump-floating"
-            onPointerDown={(event) => {
-              event.preventDefault();
-              updateField("jump", true);
-            }}
-            onPointerUp={() => updateField("jump", false)}
-            onPointerCancel={() => updateField("jump", false)}
-            onPointerLeave={() => updateField("jump", false)}
+            activeClassName="is-pressed"
+            onChange={(v) => updateField("jump", v)}
           >
             <span className="mc-jump-icon">↑</span>
             <span>JUMP</span>
-          </button>
+          </HoldButton>
 
           {steerMode === "tilt" ? (
             <div className="mc-gyro-layout">
@@ -832,13 +1752,12 @@ export default function PhoneControllerApp() {
                 </div>
 
                 {!gyroActive ? (
-                  <button
-                    type="button"
+                  <TapButton
                     className="mc-enable-gyro-action-btn"
-                    onClick={openGyroPrompt}
+                    onTrigger={openGyroPrompt}
                   >
                     ENABLE GYRO SENSORS
-                  </button>
+                  </TapButton>
                 ) : (
                   <div className="mc-gyro-horizon">
                     <div
@@ -867,13 +1786,12 @@ export default function PhoneControllerApp() {
                   </div>
                 )}
 
-                <button
-                  type="button"
+                <TapButton
                   className="mc-recenter-pill"
-                  onClick={calibrateTilt}
+                  onTrigger={calibrateTilt}
                 >
                   ZERO TILT (CENTER)
-                </button>
+                </TapButton>
               </div>
 
               <div className="mc-gyro-side">
@@ -1024,24 +1942,22 @@ export default function PhoneControllerApp() {
                 <Icons.Settings />
                 <span>CONTROLLER & HUD SETTINGS</span>
               </div>
-              <button
-                type="button"
+              <TapButton
                 className="mc-icon-btn"
-                onClick={() => setSettingsOpen(false)}
+                onTrigger={() => setSettingsOpen(false)}
               >
                 <Icons.Close />
-              </button>
+              </TapButton>
             </div>
 
             <div className="mc-setting-group">
               <div className="mc-setting-label">STEERING MODE</div>
               <div className="mc-segmented">
-                <button
-                  type="button"
+                <TapButton
                   className={
                     steerMode === "wheel" ? "mc-seg-btn active" : "mc-seg-btn"
                   }
-                  onClick={() => {
+                  onTrigger={() => {
                     setSteerMode("wheel");
                     inputRef.current.steer = 0;
                     setSteerVal(0);
@@ -1050,41 +1966,38 @@ export default function PhoneControllerApp() {
                 >
                   <Icons.Wheel />
                   <span>STEERING WHEEL</span>
-                </button>
-                <button
-                  type="button"
+                </TapButton>
+                <TapButton
                   className={
                     steerMode === "tilt" ? "mc-seg-btn active" : "mc-seg-btn"
                   }
-                  onClick={openGyroPrompt}
+                  onTrigger={openGyroPrompt}
                 >
                   <Icons.Gyro />
                   <span>GYRO TILT (PEDALS)</span>
-                </button>
+                </TapButton>
               </div>
             </div>
 
             <div className="mc-setting-group">
               <div className="mc-setting-label">STEERING SIDE (WHEEL MODE)</div>
               <div className="mc-segmented">
-                <button
-                  type="button"
+                <TapButton
                   className={
                     steerSide === "left" ? "mc-seg-btn active" : "mc-seg-btn"
                   }
-                  onClick={() => handleSteerSideChange("left")}
+                  onTrigger={() => handleSteerSideChange("left")}
                 >
                   <span>STEER LEFT · PEDALS RIGHT</span>
-                </button>
-                <button
-                  type="button"
+                </TapButton>
+                <TapButton
                   className={
                     steerSide === "right" ? "mc-seg-btn active" : "mc-seg-btn"
                   }
-                  onClick={() => handleSteerSideChange("right")}
+                  onTrigger={() => handleSteerSideChange("right")}
                 >
                   <span>STEER RIGHT · PEDALS LEFT</span>
-                </button>
+                </TapButton>
               </div>
             </div>
 
@@ -1092,22 +2005,108 @@ export default function PhoneControllerApp() {
               <div className="mc-setting-label">WORLD ENVIRONMENT</div>
               <div className="mc-segmented">
                 {Object.entries(SCENE_PRESETS).map(([key, item]) => (
-                  <button
+                  <TapButton
                     key={key}
-                    type="button"
                     className={
                       scenePreset === key ? "mc-seg-btn active" : "mc-seg-btn"
                     }
-                    onClick={() => handleSceneChange(key)}
+                    onTrigger={() => handleSceneChange(key)}
                   >
                     <span>{item.label}</span>
-                  </button>
+                  </TapButton>
                 ))}
               </div>
+            </div>
+
+            <div className="mc-setting-group">
+              <div className="mc-setting-label">
+                LAPTOP PAIR SESSION ({pairToken})
+              </div>
+              <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                <input
+                  type="text"
+                  value={pairDraft}
+                  onChange={(e) => setPairDraft(e.target.value)}
+                  placeholder="pair_xxxxxxxx"
+                  style={{
+                    flex: 1,
+                    background: "rgba(15, 23, 42, 0.85)",
+                    border: "1px solid rgba(255,255,255,0.22)",
+                    borderRadius: "8px",
+                    color: "#f8fafc",
+                    padding: "8px 10px",
+                    fontSize: "12px",
+                  }}
+                />
+                <TapButton
+                  className="mc-seg-btn active"
+                  style={{ flex: "0 0 auto", padding: "8px 14px" }}
+                  onTrigger={() => {
+                    const clean =
+                      pairDraft.trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64) ||
+                      "default";
+                    setPairDraft(clean);
+                    setPairToken(clean);
+                  }}
+                >
+                  <span>PAIR</span>
+                </TapButton>
+              </div>
+            </div>
+
+            <div className="mc-setting-group">
+              <div className="mc-setting-label">FREE FIRE CUSTOM HUD</div>
+              <TapButton
+                className="mc-seg-btn active"
+                style={{
+                  width: "100%",
+                  padding: "10px 14px",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "8px",
+                  background: "rgba(245, 184, 46, 0.22)",
+                  borderColor: "#f5b82e",
+                  color: "#ffd60a",
+                  fontWeight: 900,
+                  letterSpacing: "0.8px",
+                }}
+                onTrigger={() => {
+                  setSettingsOpen(false);
+                  setCustomHudEditing(true);
+                }}
+                data-testid="phone-settings-open-hud-btn"
+              >
+                <HudLayoutSvg />
+                <span>CUSTOMIZE HUD (SIZE, TRANSPARENCY & LAYOUT)</span>
+              </TapButton>
+            </div>
+
+            <div className="mc-setting-group">
+              <div className="mc-setting-label">DISPLAY &amp; FULLSCREEN</div>
+              <TapButton
+                className={
+                  isFullscreen ? "mc-seg-btn active" : "mc-seg-btn"
+                }
+                style={{ width: "100%", padding: "10px 14px" }}
+                onTrigger={() => {
+                  toggleFullscreen();
+                  setSettingsOpen(false);
+                }}
+              >
+                <Icons.Fullscreen />
+                <span>
+                  {isFullscreen
+                    ? "EXIT FULLSCREEN"
+                    : "ENTER FULLSCREEN LANDSCAPE"}
+                </span>
+              </TapButton>
             </div>
           </div>
         </div>
       )}
+
+      {fsHint && <div className="mc-fs-hint-pill">{fsHint}</div>}
 
       {gyroPromptOpen && (
         <div
@@ -1146,20 +2145,18 @@ export default function PhoneControllerApp() {
             {gyroError && (
               <div className="mc-gyro-modal-error">{gyroError}</div>
             )}
-            <button
-              type="button"
+            <TapButton
               className="mc-enable-gyro-action-btn"
-              onClick={requestAndEnableGyro}
+              onTrigger={requestAndEnableGyro}
             >
               {gyroError ? "RETRY GYRO ACTIVATION" : "ENABLE SENSORS"}
-            </button>
-            <button
-              type="button"
+            </TapButton>
+            <TapButton
               className="mc-recenter-pill"
-              onClick={() => setGyroPromptOpen(false)}
+              onTrigger={() => setGyroPromptOpen(false)}
             >
               CANCEL
-            </button>
+            </TapButton>
           </div>
         </div>
       )}

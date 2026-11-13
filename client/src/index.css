@@ -22,6 +22,7 @@ body,
 #root {
   width: 100%;
   height: 100%;
+  height: 100dvh;
   margin: 0;
   padding: 0;
   overflow: hidden;
@@ -215,12 +216,13 @@ button {
   position: fixed;
   top: 0;
   left: 0;
-  width: 100vw;
-  height: 100vh;
+  width: var(--mc-vw, 100vw);
+  height: var(--mc-vh, 100dvh);
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  padding: 6px 14px 12px;
+  padding: max(6px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right))
+    max(10px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
   background:
     radial-gradient(circle at 50% 40%, rgba(23, 105, 210, 0.15) 0%, transparent 65%),
     linear-gradient(180deg, #0b111c 0%, #05080d 100%);
@@ -229,8 +231,8 @@ button {
 }
 
 .mc-viewport.mc-force-landscape {
-  width: 100vh;
-  height: 100vw;
+  width: var(--mc-vh, 100dvh);
+  height: var(--mc-vw, 100vw);
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%) rotate(90deg);
@@ -1478,7 +1480,7 @@ button {
 
 .mc-char-primary-grid .mc-aux-btn {
   height: 100%;
-  min-height: 54px;
+  min-height: 38px;
 }
 
 .mc-crouch-btn {
@@ -1658,3 +1660,1770 @@ button {
   border-color: #ffffff;
   box-shadow: 0 0 22px rgba(255, 159, 10, 0.85);
 }
+
+/* ================================================================== */
+/*  FREE FIRE COMBAT HUD, CROSSHAIR, BOTS & MOBILE FIRE CONTROLS      */
+/* ================================================================== */
+
+.ff-crosshair {
+  position: absolute;
+  z-index: 15;
+  top: 50%;
+  left: 50%;
+  width: 36px;
+  height: 36px;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  transition: transform 0.08s ease;
+}
+
+.ff-crosshair.aiming {
+  transform: translate(-50%, -50%) scale(0.68);
+}
+
+.ff-crosshair.firing {
+  transform: translate(-50%, -50%) scale(1.25);
+}
+
+.ff-ch-dot {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #ff2a5f;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 6px #ff2a5f;
+}
+
+.ff-ch-line {
+  position: absolute;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.85);
+}
+
+.ff-ch-line.top {
+  top: 2px;
+  left: 50%;
+  width: 2px;
+  height: 8px;
+  transform: translateX(-50%);
+}
+
+.ff-ch-line.bottom {
+  bottom: 2px;
+  left: 50%;
+  width: 2px;
+  height: 8px;
+  transform: translateX(-50%);
+}
+
+.ff-ch-line.left {
+  left: 2px;
+  top: 50%;
+  width: 8px;
+  height: 2px;
+  transform: translateY(-50%);
+}
+
+.ff-ch-line.right {
+  right: 2px;
+  top: 50%;
+  width: 8px;
+  height: 2px;
+  transform: translateY(-50%);
+}
+
+.ff-hitmarker {
+  position: absolute;
+  inset: 5px;
+  border: 2px solid #ffffff;
+  transform: rotate(45deg);
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.8);
+}
+
+.ff-hitmarker.headshot {
+  border-color: #ff2a5f;
+  box-shadow: 0 0 14px #ff2a5f;
+}
+
+.ff-weapon-hud {
+  position: absolute;
+  z-index: 8;
+  top: 86px;
+  right: 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 220px;
+}
+
+.ff-weapon-slots {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ff-weapon-card {
+  padding: 10px 14px;
+  border-radius: 11px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(8, 14, 24, 0.82);
+  backdrop-filter: blur(12px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+
+.ff-weapon-card.active {
+  border-color: #ff9f0a;
+  background: linear-gradient(135deg, rgba(255, 159, 10, 0.28), rgba(12, 20, 34, 0.92));
+  box-shadow: 0 0 20px rgba(255, 159, 10, 0.35);
+}
+
+.ff-weapon-name {
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: 1.2px;
+}
+
+.ff-weapon-ammo {
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 16px;
+  font-weight: 800;
+  color: #00d2ff;
+}
+
+.ff-combat-actions-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.ff-mini-btn {
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(15, 24, 38, 0.86);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  cursor: pointer;
+}
+
+.ff-hp-bar-wrap {
+  margin-bottom: 10px;
+}
+
+.ff-hp-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 1.4px;
+  color: #dce6f2;
+  margin-bottom: 4px;
+}
+
+.ff-hp-track {
+  width: 100%;
+  height: 8px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+
+.ff-hp-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #32d74b, #00d2ff);
+  transition: width 0.15s ease;
+}
+
+.ff-dmg-popup {
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 22px;
+  font-weight: 800;
+  color: #ffdd57;
+  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.95);
+  white-space: nowrap;
+  pointer-events: none;
+  animation: ffFloatUp 0.65s ease-out forwards;
+}
+
+.ff-dmg-popup.ff-dmg-headshot {
+  font-size: 27px;
+  color: #ff2a5f;
+}
+
+@keyframes ffFloatUp {
+  0% {
+    opacity: 1;
+    transform: translateY(0) scale(0.9);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-28px) scale(1.15);
+  }
+}
+
+.ff-bot-nametag {
+  pointer-events: none;
+}
+
+.ff-bot-hp-track {
+  width: 54px;
+  height: 6px;
+  border-radius: 99px;
+  background: rgba(0, 0, 0, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  overflow: hidden;
+}
+
+.ff-bot-hp-fill {
+  height: 100%;
+  background: #ff2a5f;
+}
+
+.mc-fire-btn {
+  border: 2px solid rgba(255, 42, 95, 0.75);
+  background: linear-gradient(180deg, rgba(165, 20, 56, 0.92) 0%, rgba(75, 10, 26, 0.96) 100%);
+  color: #ffffff;
+}
+
+.mc-fire-btn.is-pressed {
+  transform: scale(0.94);
+  background: #ff2a5f;
+  box-shadow: 0 0 26px rgba(255, 42, 95, 0.85);
+}
+
+.mc-aim-btn {
+  border: 1.5px solid rgba(255, 214, 10, 0.65);
+  background: linear-gradient(180deg, rgba(72, 56, 12, 0.9) 0%, rgba(34, 26, 6, 0.95) 100%);
+  color: #ffd60a;
+}
+
+.mc-aim-btn.is-pressed {
+  transform: scale(0.94);
+  background: #ffd60a;
+  color: #090d14;
+  box-shadow: 0 0 22px rgba(255, 214, 10, 0.75);
+}
+
+/* ================================================================== */
+/*  CUSTOM FREE FIRE BATTLE ROYALE HUD SYSTEM                         */
+/* ================================================================== */
+
+.ff-hud-root {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 25;
+  font-family: "Barlow Condensed", "Inter", sans-serif;
+  user-select: none;
+  overflow: hidden;
+}
+
+/* 1. Top Compass Bar */
+.ff-compass-wrapper {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  pointer-events: none;
+}
+
+.ff-compass-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(10, 14, 22, 0.85);
+  padding: 2px 10px;
+  border-radius: 99px;
+  border: 1px solid rgba(255, 214, 10, 0.45);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.6);
+  margin-bottom: 3px;
+}
+
+.ff-compass-deg {
+  font-size: 13px;
+  font-weight: 800;
+  color: #ffd60a;
+  letter-spacing: 1px;
+}
+
+.ff-compass-cardinal {
+  font-size: 11px;
+  font-weight: 800;
+  color: #ffffff;
+  background: #ff2a5f;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.ff-compass-strip {
+  position: relative;
+  width: min(420px, 80vw);
+  height: 28px;
+  background: linear-gradient(90deg, rgba(10, 14, 22, 0) 0%, rgba(10, 14, 22, 0.78) 25%, rgba(10, 14, 22, 0.78) 75%, rgba(10, 14, 22, 0) 100%);
+  overflow: hidden;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  mask-image: linear-gradient(90deg, transparent 0%, black 20%, black 80%, transparent 100%);
+}
+
+.ff-compass-tape {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  transition: transform 0.05s linear;
+}
+
+.ff-compass-tick {
+  position: absolute;
+  top: 0;
+  width: 2px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  transform: translateX(-50%);
+}
+
+.ff-compass-tick .tick-line {
+  width: 1px;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.ff-compass-tick.cardinal .tick-line {
+  width: 2px;
+  height: 12px;
+  background: #ffd60a;
+}
+
+.ff-compass-tick .tick-label {
+  font-size: 9px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.6);
+  margin-top: 2px;
+}
+
+.ff-compass-tick.cardinal .tick-label {
+  color: #ffd60a;
+  font-weight: 800;
+  font-size: 11px;
+}
+
+.ff-compass-needle {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 2px;
+  height: 16px;
+  background: #ff2a5f;
+  box-shadow: 0 0 8px #ff2a5f;
+}
+
+/* 2. Top-Left Survival Status */
+.ff-match-stats-panel {
+  position: absolute;
+  top: 14px;
+  left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  pointer-events: auto;
+}
+
+.ff-br-logo-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: linear-gradient(135deg, rgba(255, 60, 0, 0.25), rgba(12, 17, 28, 0.85));
+  border: 1px solid rgba(255, 120, 0, 0.45);
+  padding: 4px 10px;
+  border-radius: 6px;
+  width: fit-content;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+}
+
+.ff-flame-icon {
+  font-size: 13px;
+}
+
+.ff-br-text {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 1.2px;
+  color: #ff9f0a;
+}
+
+.ff-survival-pill-row {
+  display: flex;
+  gap: 8px;
+}
+
+.ff-survival-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 9px;
+  background: rgba(10, 16, 26, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.6);
+}
+
+.ff-survival-pill.alive-pill {
+  border-color: rgba(0, 210, 255, 0.45);
+}
+
+.ff-survival-pill.kills-pill {
+  border-color: rgba(255, 42, 95, 0.55);
+}
+
+.ff-svg-icon {
+  width: 18px;
+  height: 18px;
+  color: #00d2ff;
+}
+
+.ff-svg-icon.skull-icon {
+  color: #ff2a5f;
+}
+
+.pill-content {
+  display: flex;
+  flex-direction: column;
+}
+
+.pill-title {
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 1.5px;
+  color: #8fa2b8;
+}
+
+.pill-value {
+  font-size: 17px;
+  font-weight: 800;
+  line-height: 1;
+  color: #ffffff;
+}
+
+.alive-pill .pill-value {
+  color: #00d2ff;
+}
+
+.kills-pill .pill-value {
+  color: #ff2a5f;
+}
+
+.ff-safezone-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(7, 10, 18, 0.82);
+  border: 1px solid rgba(255, 214, 10, 0.35);
+  padding: 3px 8px;
+  border-radius: 5px;
+  width: fit-content;
+}
+
+.ff-zone-pulse-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #ffd60a;
+  box-shadow: 0 0 8px #ffd60a;
+  animation: ffPulse 1s infinite alternate;
+}
+
+@keyframes ffPulse {
+  0% { transform: scale(0.8); opacity: 0.6; }
+  100% { transform: scale(1.3); opacity: 1; }
+}
+
+.ff-zone-text {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  color: #dce6f2;
+}
+
+/* 3. Top-Right Minimap Radar */
+.ff-minimap-container {
+  position: absolute;
+  top: 14px;
+  right: 18px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  pointer-events: auto;
+}
+
+.ff-minimap-frame {
+  position: relative;
+  width: 105px;
+  height: 105px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(14, 25, 42, 0.9) 0%, rgba(6, 10, 18, 0.95) 100%);
+  border: 2px solid rgba(255, 214, 10, 0.55);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.8), inset 0 0 16px rgba(0, 210, 255, 0.15);
+  overflow: hidden;
+}
+
+.ff-radar-sweep {
+  position: absolute;
+  inset: 0;
+  background: conic-gradient(from 0deg at 50% 50%, rgba(255, 214, 10, 0.25) 0deg, transparent 65deg);
+  border-radius: 50%;
+  animation: ffRadarSweep 3.5s linear infinite;
+}
+
+@keyframes ffRadarSweep {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+.ff-radar-player-arrow {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 0;
+  height: 0;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-bottom: 12px solid #ffd60a;
+  filter: drop-shadow(0 0 4px #ffd60a);
+}
+
+.ff-radar-center-dot {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #ffffff;
+  transform: translate(-50%, -50%);
+}
+
+.ff-radar-zone-ring {
+  position: absolute;
+  inset: 14px;
+  border-radius: 50%;
+  border: 1px dashed rgba(0, 210, 255, 0.65);
+}
+
+.ff-minimap-n-tag {
+  position: absolute;
+  top: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 8px;
+  font-weight: 800;
+  color: #ff2a5f;
+}
+
+.ff-minimap-coords {
+  position: absolute;
+  bottom: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 7px;
+  font-weight: 700;
+  color: #8fa2b8;
+  white-space: nowrap;
+}
+
+.ff-top-tool-row {
+  display: flex;
+  gap: 6px;
+}
+
+.ff-hud-btn-circle {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: rgba(12, 18, 30, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  backdrop-filter: blur(8px);
+  color: #dce6f2;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+
+.ff-hud-btn-circle svg {
+  width: 15px;
+  height: 15px;
+}
+
+.ff-hud-btn-circle:hover {
+  transform: scale(1.08);
+  border-color: #ffd60a;
+  color: #ffd60a;
+}
+
+/* 4. Center Free Fire Dynamic Reticle */
+.ff-crosshair-hud {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 34px;
+  height: 34px;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  transition: transform 0.08s ease;
+}
+
+.ff-crosshair-hud.aiming {
+  transform: translate(-50%, -50%) scale(0.65);
+}
+
+.ff-crosshair-hud.firing {
+  transform: translate(-50%, -50%) scale(1.35);
+}
+
+.ff-reticle-center-dot {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #ff2a5f;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 6px #ff2a5f;
+}
+
+.ff-reticle-tick {
+  position: absolute;
+  background: #ffffff;
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.9);
+}
+
+.ff-reticle-tick.top {
+  top: 0;
+  left: 50%;
+  width: 2px;
+  height: 7px;
+  transform: translateX(-50%);
+}
+
+.ff-reticle-tick.bottom {
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  height: 7px;
+  transform: translateX(-50%);
+}
+
+.ff-reticle-tick.left {
+  left: 0;
+  top: 50%;
+  width: 7px;
+  height: 2px;
+  transform: translateY(-50%);
+}
+
+.ff-reticle-tick.right {
+  right: 0;
+  top: 50%;
+  width: 7px;
+  height: 2px;
+  transform: translateY(-50%);
+}
+
+.ff-hitmarker-skull {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 26px;
+  filter: drop-shadow(0 0 8px #ff2a5f);
+  animation: ffHitPop 0.22s ease-out forwards;
+}
+
+.ff-hitmarker-skull.headshot {
+  color: #ff2a5f;
+  font-size: 32px;
+}
+
+@keyframes ffHitPop {
+  0% { transform: translate(-50%, -50%) scale(0.6); opacity: 1; }
+  50% { transform: translate(-50%, -50%) scale(1.3); }
+  100% { transform: translate(-50%, -50%) scale(1); opacity: 0; }
+}
+
+/* 5. Right-Side Free Fire Weapon Cards */
+.ff-weapon-deck {
+  position: absolute;
+  top: 140px;
+  right: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 215px;
+  pointer-events: auto;
+}
+
+.ff-deck-slots {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.ff-gun-card {
+  position: relative;
+  padding: 8px 12px;
+  background: linear-gradient(135deg, rgba(14, 20, 32, 0.92) 0%, rgba(8, 12, 20, 0.96) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.15s ease;
+  overflow: hidden;
+}
+
+.ff-gun-card.active {
+  border-color: #ffd60a;
+  background: linear-gradient(135deg, rgba(255, 214, 10, 0.22) 0%, rgba(12, 18, 28, 0.96) 100%);
+  box-shadow: 0 0 18px rgba(255, 214, 10, 0.35);
+  transform: translateX(-4px);
+}
+
+.gun-card-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  color: #8fa2b8;
+  margin-bottom: 2px;
+}
+
+.ff-gun-card.active .gun-card-header {
+  color: #ffd60a;
+}
+
+.gun-card-body {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.gun-name {
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: 1.1px;
+  color: #ffffff;
+}
+
+.gun-ammo {
+  font-size: 16px;
+  font-weight: 800;
+  color: #00d2ff;
+}
+
+.gun-ammo .mag-count {
+  font-size: 17px;
+  color: #ffffff;
+}
+
+.gun-ammo .ammo-divider {
+  margin: 0 2px;
+  color: #8fa2b8;
+}
+
+.gun-ammo .reserve-count {
+  font-size: 13px;
+  color: #00d2ff;
+}
+
+.reloading-text {
+  font-size: 11px;
+  color: #ffd60a;
+  animation: ffBlink 0.6s infinite alternate;
+}
+
+@keyframes ffBlink {
+  0% { opacity: 0.4; }
+  100% { opacity: 1; }
+}
+
+.ff-weapon-quick-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.ff-action-pill {
+  height: 32px;
+  border-radius: 6px;
+  background: rgba(14, 22, 34, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+
+.ff-action-pill:hover {
+  background: rgba(255, 214, 10, 0.25);
+  border-color: #ffd60a;
+  color: #ffd60a;
+}
+
+.pill-hotkey {
+  background: rgba(255, 255, 255, 0.18);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 9px;
+  color: #ffffff;
+}
+
+/* 6. Bottom-Center Vitals (EP + HP + Armor) */
+.ff-bottom-vital-panel {
+  position: absolute;
+  bottom: 22px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: min(440px, 92vw);
+  pointer-events: auto;
+}
+
+.ff-gear-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ff-gear-badge {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(10, 16, 26, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+
+.gear-icon {
+  font-size: 15px;
+}
+
+.gear-details {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.gear-lvl {
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  color: #00d2ff;
+}
+
+.gear-bar-track {
+  width: 100%;
+  height: 4px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.15);
+  overflow: hidden;
+  margin-top: 2px;
+}
+
+.gear-bar-fill {
+  height: 100%;
+  background: #00d2ff;
+}
+
+.ff-medkit-slot {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: linear-gradient(135deg, rgba(35, 120, 60, 0.45), rgba(10, 20, 14, 0.9));
+  border: 1px solid rgba(50, 215, 75, 0.55);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+  color: #ffffff;
+}
+
+.medkit-hotkey {
+  font-size: 8px;
+  font-weight: 800;
+  color: #32d74b;
+}
+
+.medkit-icon {
+  font-size: 14px;
+}
+
+.medkit-count {
+  font-size: 13px;
+  font-weight: 800;
+  color: #ffffff;
+}
+
+.ff-vitals-container {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: rgba(8, 14, 24, 0.88);
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(10px);
+}
+
+.ff-bar-unit {
+  display: flex;
+  flex-direction: column;
+}
+
+.ff-bar-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  margin-bottom: 2px;
+}
+
+.ep-title {
+  color: #ffd60a;
+}
+
+.hp-title {
+  color: #32d74b;
+}
+
+.ff-bar-num {
+  font-size: 11px;
+  font-weight: 800;
+  color: #ffffff;
+}
+
+.ff-bar-track {
+  width: 100%;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+
+.ep-track {
+  height: 5px;
+}
+
+.hp-track {
+  height: 9px;
+}
+
+.ep-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #ff9f0a, #ffd60a);
+  transition: width 0.2s ease;
+}
+
+.hp-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #28cd41, #00d2ff);
+  transition: width 0.15s ease;
+}
+
+.hp-fill.critical {
+  background: linear-gradient(90deg, #ff2a5f, #ff9f0a);
+}
+
+/* 7. On-Screen Touch / Action Controls */
+.ff-on-screen-controls {
+  position: absolute;
+  bottom: 30px;
+  right: 28px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 12px;
+  pointer-events: auto;
+}
+
+.ff-circle-control {
+  width: 58px;
+  height: 58px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(20, 28, 44, 0.92) 0%, rgba(10, 14, 22, 0.98) 100%);
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.75);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  transition: all 0.12s ease;
+}
+
+.ff-circle-control .btn-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.ff-circle-control .btn-icon {
+  font-size: 18px;
+}
+
+.ff-circle-control .btn-subtext {
+  font-size: 7px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  color: #8fa2b8;
+}
+
+.ff-circle-control:hover,
+.ff-circle-control.active {
+  transform: scale(1.08);
+  border-color: #ffd60a;
+}
+
+.ff-circle-control.fire-btn {
+  width: 72px;
+  height: 72px;
+  border-color: rgba(255, 42, 95, 0.85);
+  background: radial-gradient(circle, rgba(185, 24, 65, 0.92) 0%, rgba(85, 10, 30, 0.98) 100%);
+  box-shadow: 0 0 28px rgba(255, 42, 95, 0.55);
+}
+
+.ff-circle-control.fire-btn .btn-icon {
+  font-size: 24px;
+}
+
+.ff-circle-control.fire-btn:active,
+.ff-circle-control.fire-btn.active {
+  transform: scale(0.94);
+  background: #ff2a5f;
+  box-shadow: 0 0 36px #ff2a5f;
+}
+
+.ff-circle-control.aim-btn {
+  border-color: rgba(0, 210, 255, 0.75);
+}
+
+.ff-circle-control.aim-btn.active {
+  background: rgba(0, 210, 255, 0.35);
+  border-color: #00d2ff;
+}
+
+.ff-circle-control.drive-btn {
+  border-color: #ffd60a;
+  background: radial-gradient(circle, rgba(255, 214, 10, 0.35) 0%, rgba(18, 25, 38, 0.95) 100%);
+  animation: ffDriveGlow 1.2s infinite alternate;
+}
+
+@keyframes ffDriveGlow {
+  0% { box-shadow: 0 0 12px rgba(255, 214, 10, 0.4); }
+  100% { box-shadow: 0 0 28px rgba(255, 214, 10, 0.85); }
+}
+
+/* ==========================================================================
+   FREE FIRE BATTLE ROYALE: KILL FEED & CENTER KILL BANNER
+   ========================================================================== */
+.ff-killfeed-container {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 8px;
+  pointer-events: none;
+}
+
+.ff-killfeed-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: rgba(14, 21, 33, 0.85);
+  border-left: 3px solid rgba(255, 255, 255, 0.3);
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #dce7f5;
+  backdrop-filter: blur(4px);
+  animation: ffFeedFadeIn 0.25s ease-out;
+}
+
+.ff-killfeed-item.player-kill {
+  border-left: 3px solid #ff2a5f;
+  background: rgba(45, 12, 22, 0.9);
+  color: #fff;
+  box-shadow: 0 2px 10px rgba(255, 42, 95, 0.35);
+}
+
+.ff-killer-name {
+  color: #ffd60a;
+  letter-spacing: 0.5px;
+}
+
+.ff-killfeed-item.player-kill .ff-killer-name {
+  color: #ff3b5c;
+  font-weight: 900;
+}
+
+.ff-kill-icon {
+  font-size: 11px;
+}
+
+.ff-victim-name {
+  color: #a4b3c7;
+}
+
+.ff-headshot-tag {
+  padding: 1px 4px;
+  background: #ff2a5f;
+  border-radius: 3px;
+  font-size: 8px;
+  font-weight: 900;
+  color: #fff;
+  letter-spacing: 0.6px;
+}
+
+@keyframes ffFeedFadeIn {
+  from { opacity: 0; transform: translateX(-12px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+/* Center Elimination Banner */
+.ff-center-kill-banner {
+  position: absolute;
+  top: 76px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 24px;
+  background: linear-gradient(90deg, rgba(160, 16, 48, 0.95), rgba(70, 8, 22, 0.95));
+  border-top: 1px solid rgba(255, 120, 150, 0.6);
+  border-bottom: 2px solid #ff2a5f;
+  border-radius: 8px;
+  box-shadow: 0 0 35px rgba(255, 42, 95, 0.7);
+  pointer-events: none;
+  z-index: 99;
+}
+
+.kill-banner-skull {
+  font-size: 26px;
+  filter: drop-shadow(0 0 8px #ff2a5f);
+}
+
+.kill-banner-content {
+  display: flex;
+  flex-direction: column;
+}
+
+.kill-banner-title {
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 1.5px;
+  color: #ff85a1;
+  text-transform: uppercase;
+}
+
+.kill-banner-victim {
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 20px;
+  font-weight: 900;
+  letter-spacing: 1.2px;
+  color: #fff;
+}
+
+.animate-kill-slide {
+  animation: ffKillPop 0.3s cubic-bezier(0.18, 0.89, 0.32, 1.28);
+}
+
+@keyframes ffKillPop {
+  0% { transform: translate(-50%, -18px) scale(0.85); opacity: 0; }
+  100% { transform: translate(-50%, 0) scale(1); opacity: 1; }
+}
+
+/* Bot Name Tag in 3D Space */
+.ff-bot-nametag {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  transform: translateY(-8px);
+}
+
+.ff-bot-name-label {
+  padding: 1px 6px;
+  background: rgba(14, 21, 33, 0.85);
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  color: #ffd60a;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+}
+
+/* ==========================================================================
+   FREE FIRE VICTORY (BOOYAH!) & DEFEAT FULLSCREEN MODAL
+   ========================================================================== */
+.ff-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  pointer-events: auto;
+}
+
+.ff-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at center, rgba(10, 16, 26, 0.88) 0%, rgba(3, 5, 10, 0.97) 100%);
+  backdrop-filter: blur(12px);
+}
+
+.ff-result-card {
+  position: relative;
+  z-index: 2;
+  width: min(520px, 92vw);
+  padding: 36px 28px 28px;
+  border-radius: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+  text-align: center;
+  box-shadow: 0 25px 70px rgba(0, 0, 0, 0.85);
+}
+
+/* Victory Theme (Gold / Fire) */
+.victory-theme .ff-result-card {
+  background: linear-gradient(175deg, rgba(32, 24, 12, 0.95), rgba(12, 14, 20, 0.98));
+  border: 2px solid rgba(255, 214, 10, 0.55);
+  box-shadow: 0 0 80px rgba(255, 214, 10, 0.35);
+}
+
+/* Defeat Theme (Crimson / Dark) */
+.defeat-theme .ff-result-card {
+  background: linear-gradient(175deg, rgba(38, 12, 20, 0.95), rgba(14, 10, 14, 0.98));
+  border: 2px solid rgba(255, 42, 95, 0.55);
+  box-shadow: 0 0 80px rgba(255, 42, 95, 0.35);
+}
+
+.animate-pop-in {
+  animation: ffResultCardPop 0.4s cubic-bezier(0.18, 0.89, 0.32, 1.25);
+}
+
+@keyframes ffResultCardPop {
+  from { opacity: 0; transform: scale(0.82) translateY(24px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* Booyah Badge */
+.ff-booyah-badge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.ff-booyah-flames {
+  font-size: 32px;
+  animation: ffPulseFlame 1.2s infinite alternate;
+}
+
+@keyframes ffPulseFlame {
+  0% { transform: scale(0.95); opacity: 0.85; }
+  100% { transform: scale(1.1); opacity: 1; }
+}
+
+.ff-booyah-title {
+  margin: 0;
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 64px;
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 4px;
+  background: linear-gradient(180deg, #fff9d6 0%, #ffd60a 40%, #ff9f0a 80%, #d46800 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  filter: drop-shadow(0 6px 18px rgba(255, 214, 10, 0.65));
+}
+
+.ff-booyah-sub {
+  font-size: 13px;
+  font-weight: 900;
+  letter-spacing: 4px;
+  color: #ffd60a;
+}
+
+/* Defeat Badge */
+.ff-defeat-badge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.ff-defeat-skull {
+  font-size: 42px;
+  filter: drop-shadow(0 0 16px rgba(255, 42, 95, 0.7));
+}
+
+.ff-defeat-title {
+  margin: 0;
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 54px;
+  font-weight: 900;
+  letter-spacing: 3px;
+  background: linear-gradient(180deg, #ffdce0 0%, #ff3b5c 50%, #b80d2d 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  filter: drop-shadow(0 6px 18px rgba(255, 42, 95, 0.65));
+}
+
+.ff-defeat-sub {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 3px;
+  color: #a4b3c7;
+}
+
+/* Placement Pill */
+.ff-rank-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 18px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.ff-rank-pill .rank-label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 1.5px;
+  color: #8fa2b8;
+}
+
+.ff-rank-pill .rank-value {
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 20px;
+  font-weight: 900;
+  color: #fff;
+}
+
+.ff-rank-pill .rank-value.first {
+  color: #ffd60a;
+}
+
+.ff-rank-pill .rank-value small {
+  font-size: 13px;
+  color: #8fa2b8;
+}
+
+/* Stats Grid */
+.ff-stats-grid {
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+  gap: 10px;
+}
+
+.ff-stat-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 12px 6px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.ff-stat-box .stat-icon {
+  font-size: 20px;
+}
+
+.ff-stat-box .stat-title {
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  color: #8fa2b8;
+}
+
+.ff-stat-box .stat-val {
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 22px;
+  font-weight: 900;
+  color: #fff;
+}
+
+/* Modal Actions */
+.ff-modal-actions {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.ff-btn-primary.booyah-btn {
+  width: 100%;
+  padding: 14px 20px;
+  border-radius: 12px;
+  border: none;
+  cursor: pointer;
+  background: linear-gradient(90deg, #ffd60a, #ff9f0a);
+  color: #0b111b;
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 20px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  box-shadow: 0 8px 25px rgba(255, 214, 10, 0.45);
+  transition: all 0.15s ease;
+}
+
+.defeat-theme .ff-btn-primary.booyah-btn {
+  background: linear-gradient(90deg, #ff3b5c, #d4143a);
+  color: #fff;
+  box-shadow: 0 8px 25px rgba(255, 42, 95, 0.45);
+}
+
+.ff-btn-primary.booyah-btn:hover {
+  transform: translateY(-2px);
+  filter: brightness(1.1);
+}
+
+.ff-btn-secondary {
+  width: 100%;
+  padding: 10px 16px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.05);
+  color: #cbd5e1;
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.ff-btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+/* ==========================================================================
+   FREE FIRE BATTLE ROYALE: BACKPACK & INVENTORY OVERLAY (PHASE 2C)
+   ========================================================================== */
+.ff-inv-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 950;
+  background: rgba(4, 7, 14, 0.82);
+  backdrop-filter: blur(10px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  animation: ffInvFadeIn 0.18s ease-out;
+  pointer-events: auto;
+}
+
+@keyframes ffInvFadeIn {
+  from { opacity: 0; transform: scale(0.97); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.ff-inv-panel {
+  width: min(840px, 94vw);
+  max-height: 80vh;
+  display: grid;
+  grid-template-columns: 210px 1fr 220px;
+  gap: 16px;
+  background: linear-gradient(160deg, rgba(16, 24, 38, 0.95), rgba(8, 12, 20, 0.98));
+  border: 1px solid rgba(0, 210, 255, 0.28);
+  border-radius: 16px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.85);
+  padding: 20px;
+  overflow: hidden;
+}
+
+.ff-inv-section-title {
+  margin: 0 0 12px 0;
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 15px;
+  font-weight: 900;
+  letter-spacing: 1.5px;
+  color: #ffd60a;
+  text-transform: uppercase;
+  border-bottom: 1px solid rgba(255, 214, 10, 0.2);
+  padding-bottom: 4px;
+}
+
+/* Equipment Column */
+.ff-inv-equip-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ff-inv-slot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  transition: all 0.12s ease;
+}
+
+.ff-inv-slot.equipped {
+  border-color: rgba(0, 210, 255, 0.45);
+  background: rgba(0, 210, 255, 0.08);
+}
+
+.ff-inv-slot.active-weapon {
+  border-color: #ffd60a;
+  box-shadow: 0 0 12px rgba(255, 214, 10, 0.3);
+}
+
+.ff-inv-slot-icon {
+  font-size: 20px;
+}
+
+.ff-inv-slot-label {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  color: #8fa2b8;
+  text-transform: uppercase;
+  min-width: 55px;
+}
+
+.ff-inv-slot-name {
+  font-size: 11px;
+  font-weight: 800;
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ff-inv-slot-ammo {
+  font-size: 10px;
+  font-weight: 800;
+  color: #ffd60a;
+  margin-left: auto;
+}
+
+/* Backpack Center Grid */
+.ff-inv-backpack {
+  display: flex;
+  flex-direction: column;
+}
+
+.ff-inv-backpack-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(95px, 1fr));
+  gap: 10px;
+  overflow-y: auto;
+  max-height: 55vh;
+  padding-right: 6px;
+}
+
+.ff-inv-empty {
+  grid-column: 1 / -1;
+  text-align: center;
+  color: #64748b;
+  font-size: 13px;
+  padding: 40px 0;
+}
+
+.ff-inv-item-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 6px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  position: relative;
+  text-align: center;
+}
+
+.ff-inv-item-card:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 214, 10, 0.4);
+}
+
+.ff-inv-item-card.selected {
+  border-color: #ffd60a;
+  background: rgba(255, 214, 10, 0.12);
+  box-shadow: 0 0 14px rgba(255, 214, 10, 0.35);
+}
+
+.ff-inv-item-icon {
+  font-size: 24px;
+}
+
+.ff-inv-item-name {
+  font-size: 10px;
+  font-weight: 800;
+  color: #dce7f5;
+  line-height: 1.2;
+}
+
+.ff-inv-item-qty {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  font-size: 9px;
+  font-weight: 900;
+  color: #ffd60a;
+}
+
+/* Details Right Panel */
+.ff-inv-details-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 8px;
+}
+
+.ff-inv-detail-icon {
+  font-size: 40px;
+  margin-top: 8px;
+}
+
+.ff-inv-detail-name {
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 18px;
+  font-weight: 900;
+  color: #fff;
+}
+
+.ff-inv-detail-rarity {
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: #ffd60a;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(255, 214, 10, 0.15);
+}
+
+.ff-inv-detail-stat {
+  font-size: 11px;
+  font-weight: 800;
+  color: #8fa2b8;
+}
+
+.ff-inv-actions {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.ff-inv-action-btn {
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  background: linear-gradient(90deg, #ffd60a, #ff9f0a);
+  color: #0b111b;
+  font-family: "Barlow Condensed", sans-serif;
+  font-size: 14px;
+  font-weight: 900;
+  letter-spacing: 1px;
+  transition: all 0.12s ease;
+}
+
+.ff-inv-action-btn:hover {
+  filter: brightness(1.15);
+}
+
+.ff-inv-action-drop {
+  background: rgba(255, 42, 95, 0.2);
+  color: #ff3b5c;
+  border: 1px solid rgba(255, 42, 95, 0.4);
+}
+
+.ff-inv-action-drop:hover {
+  background: #ff2a5f;
+  color: #fff;
+}
+
+.ff-inv-close-hint {
+  margin-top: 14px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  color: #8fa2b8;
+}
+
+/* Screen Damage Flash for Safe Zone */
+.ff-zone-damage-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 940;
+  pointer-events: none;
+  box-shadow: inset 0 0 80px rgba(0, 136, 255, 0.85), inset 0 0 140px rgba(255, 42, 95, 0.55);
+  animation: ffZonePulse 0.22s ease-out;
+}
+
+@keyframes ffZonePulse {
+  from { opacity: 0.95; }
+  to { opacity: 0; }
+}
+
+.ff-safezone-banner.shrinking {
+  border-color: #ff2a5f;
+  background: rgba(185, 24, 65, 0.35);
+  box-shadow: 0 0 15px rgba(255, 42, 95, 0.4);
+}
+
+.ff-safezone-banner.shrinking .ff-zone-pulse-dot {
+  background: #ff2a5f;
+  box-shadow: 0 0 10px #ff2a5f;
+}
+
